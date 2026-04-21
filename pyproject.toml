@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-elephant"
+version = "0.1.0"
+description = "Chinese chess policy network (successor-plane CE, 7-channel signed pieces)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.20",
+    "xmltodict>=0.13",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.4"]
+training = ["torch>=2.0", "pandas>=1.1", "tensorboard>=2.14"]
+
+[project.scripts]
+my-train-policy = "my_elephant.training.train_policy_torch:main"
+my-play-policy = "my_elephant.training.play_policy_torch:main"
+my-split-cbf-lists = "my_elephant.data_prep.split_manifest:main"
+my-collect-playbook-ids = "my_elephant.data_prep.imsa_catalog:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["my_elephant*", "cchess*"]
