@@ -3,7 +3,7 @@
 在 [Icy Elephant](https://github.com/bupticybee/icyElephant) 思路上整理的中国象棋 **PyTorch 策略 + 价值训练 / 图形对弈** 代码：
 
 - **策略头（与 UI 一致：先选子再选落点）**：仅用走棋前当前局面的 **7 路有符号兵种平面**（红 +1 / 黑 −1，固定红方棋盘视角）过共享编码主干（默认 **ResNet**：``3×3`` stem + 若干 **ResBlock** + 全局平均池化；卷积塔与上游仓库提交 [``91e27b25``](https://github.com/StarlightChessOrg/MyElephant/commit/91e27b25d1448bb844eb44821257958810a672ca) 中 ``SuccessorPolicy`` 塔结构一致）→ **起点格** 90 类（ICCS 展平 `y*9+x`）+ 在 teacher/推理给定起点 one-hot 后 **落点格** 90 类；训练时对起点、落点各做交叉熵（落点 mask 为「在棋谱真实起点下」的合法到达格）。
-- **价值头**：同一主干池化后输出红方 **胜 / 和 / 负** 三分类 logit，与棋谱 `Head/RecordResult` 对齐做交叉熵（无标签样本忽略）。
+- **价值头**：同一主干池化后输出**行棋方** **胜 / 和 / 负** 三分类 logit；棋谱 `RecordResult` 先解析为红方结果，再按是否轮到红走转为行棋方标签后做交叉熵（无标签样本忽略）。盘面输入**固定红方视角**，不按行棋方翻转；**不**把「轮到谁」编入张量。
 - 走棋方不进平面编码；MCTS / 纯网络走子用分解式 `P(着)=P(起点)P(落点|起点)` 在合法着集合上归一化得到 prior。
 
 ## 目录
@@ -85,7 +85,7 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 | 简称 | 含义 | 与 TensorBoard / 验证打印的对应 |
 |------|------|--------------------------------|
 | **ACCjoint** | **整着联合准确率**：对每个样本，在合法起点 mask 上做 `argmax` 得到预测起点、在「该局面下、棋谱真实起点对应的合法落点」mask 上做 `argmax` 得到预测落点；**两者同时等于棋谱标签**的样本占比。等价于「两阶段分类都对」才算对一步棋。 | `train/acc_move_joint`、`val/acc_move_joint`；验证结束时的 `TEST ACC(joint move)%` |
-| **ACCout** | **红方终局（outcome）准确率**：价值头对 **红胜 / 和 / 红负** 三类的 `argmax` 是否与棋谱 `RecordResult` 映射后的标签一致；**无终局标签的样本**（`RecordResult` 为 `0` 或缺失等，内部为 `VALUE_LABEL_IGNORE`）**不参与分子与分母**。 | `train/acc_red_outcome`、`val/acc_red_outcome`（仅在有标注的 step / 验证集上至少有一个标注样本时写入）；验证结束时的 `ACC(red-out)%` 为**整轮验证中所有带标签样本**上的 micro 准确率 |
+| **ACCout** | **行棋方终局（outcome）准确率**：价值头对 **当前行棋方** 胜/和/负三类的 `argmax` 是否与经 ``stm_outcome_class_from_red_outcome`` 对齐的标签一致；**无终局标签的样本**（`RecordResult` 为 `0` 或缺失等，内部为 `VALUE_LABEL_IGNORE`）**不参与分子与分母**。 | `train/acc_stm_outcome`、`val/acc_stm_outcome`（仅在有标注的 step / 验证集上至少有一个标注样本时写入）；验证结束时的 `ACC(stm-out)%` 为**整轮验证中所有带标签样本**上的 micro 准确率 |
 
 **为何不能和「随机猜 33%」直接比？**
 

@@ -1,5 +1,5 @@
 """
-使用 PyTorch 训练两阶段策略（起点格 + 落点格 CE）与红方胜/和/负价值头
+使用 PyTorch 训练两阶段策略（起点格 + 落点格 CE）与**行棋方**胜/和/负价值头
 （``Head/RecordResult`` CE，与 ``cchess.reader_xqf`` 编码一致）。主干为 **ResNet 卷积塔**（与 ``StarlightChessOrg/MyElephant`` 提交 ``91e27b25`` 中塔结构一致）+ 当前两阶段策略头与三分类价值头。
 
 依赖：pip install torch pandas（GPU 需对应 CUDA 版 torch）。
@@ -148,7 +148,7 @@ def _parse_args() -> argparse.Namespace:
         "--value-loss-weight",
         type=float,
         default=0.5,
-        help="红方胜/和/负价值头交叉熵相对策略 CE 的权重（无 RecordResult 标签的样本自动忽略）",
+        help="行棋方胜/和/负价值头交叉熵相对策略 CE 的权重（无 RecordResult 标签的样本自动忽略）",
     )
     return p.parse_args()
 
@@ -310,12 +310,10 @@ def main() -> None:
         pb.startjob()
         for batch_i in range(args.n_batch):
             try:
-                batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, _batch_red, batch_yv = next(train_iter)
+                batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, batch_yv = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, _batch_red, batch_yv = next(
-                    train_iter
-                )
+                batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, batch_yv = next(train_iter)
             x_cur = batched_current_nhwc_to_torch(
                 batch_cur, device, pin_memory=pin_mem, non_blocking=pin_mem
             )
@@ -371,7 +369,7 @@ def main() -> None:
             # 无终局标签的 batch 里 acc_v 被定义为 0；不参与 TensorBoard / 进度条 EMA，否则会远低于随机三分类基线。
             if labeled_v.any():
                 writer.add_scalar("train/loss_value", float(loss_v.item()), global_step)
-                writer.add_scalar("train/acc_red_outcome", float(acc_v.item()), global_step)
+                writer.add_scalar("train/acc_stm_outcome", float(acc_v.item()), global_step)
                 expacc_v.update(float(acc_v.item()) * 100)
                 exploss_v.update(float(loss_v.item()))
 
@@ -399,10 +397,10 @@ def main() -> None:
         with torch.no_grad():
             for _ in range(args.n_batch_test):
                 try:
-                    batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, _br, batch_yv = next(test_iter)
+                    batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, batch_yv = next(test_iter)
                 except StopIteration:
                     test_iter = iter(test_loader)
-                    batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, _br, batch_yv = next(test_iter)
+                    batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, batch_yv = next(test_iter)
                 x_cur = batched_current_nhwc_to_torch(
                     batch_cur, device, pin_memory=pin_mem, non_blocking=pin_mem
                 )
@@ -441,7 +439,7 @@ def main() -> None:
         acc_v_pct = (100.0 * val_acc_v) if val_v_total else float("nan")
         print(
             f"TEST ACC(joint)={acc_j_pct:.2f}% "
-            f"ACC(red-out)={acc_v_pct:.2f}% "
+            f"ACC(stm-out)={acc_v_pct:.2f}% "
             f"LOSS total={float(np.average(losses)):.4f} "
             f"pol={float(np.average(losses_p)):.4f} "
             f"val={val_loss_v:.4f}"
@@ -452,7 +450,7 @@ def main() -> None:
             writer.add_scalar("val/loss_value", val_loss_v, epoch)
         writer.add_scalar("val/acc_move_joint", float(np.average(accs)), epoch)
         if val_v_total:
-            writer.add_scalar("val/acc_red_outcome", float(val_acc_v), epoch)
+            writer.add_scalar("val/acc_stm_outcome", float(val_acc_v), epoch)
         print()
 
         val_loss = float(np.average(losses))

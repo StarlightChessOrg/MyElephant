@@ -17,7 +17,11 @@ from my_elephant.chess.rationale import (
     RED_OUTCOME_DRAW,
     RED_OUTCOME_LOSS,
     RED_OUTCOME_WIN,
+    STM_OUTCOME_DRAW,
+    STM_OUTCOME_LOSS,
+    STM_OUTCOME_WIN,
     VALUE_LABEL_IGNORE,
+    stm_outcome_class_from_red_outcome,
 )
 from my_elephant.chess.session import GamePlay, legal_moves_iccs_for_board
 from my_elephant.chess.xml_samples import (
@@ -38,7 +42,11 @@ __all__ = [
     "RED_OUTCOME_WIN",
     "RED_OUTCOME_DRAW",
     "RED_OUTCOME_LOSS",
+    "STM_OUTCOME_WIN",
+    "STM_OUTCOME_DRAW",
+    "STM_OUTCOME_LOSS",
     "VALUE_LABEL_IGNORE",
+    "stm_outcome_class_from_red_outcome",
     "encode_picker_planes",
     "encode_signed_seven_planes",
     "encode_model_planes",

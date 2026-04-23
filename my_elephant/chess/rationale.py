@@ -3,7 +3,7 @@
 让网络更容易接触「为何要走」的结构化线索（仍需训练目标配合，并非单靠特征即可学理）。
 
 11 个附加平面（`encode_rationale_planes` 堆叠顺序）：
-  1–7. 九宫、半场、轮到谁走、帅/将位、被将军（同前）
+  1–7. 九宫、半场、（原「轮到谁走」位已弃用，恒为 0）、帅/将位、被将军（同前）
   8. 带符号子力价值
   9. 行棋方「着法数」灵活度 min(1, n/25)
  10. 对方着法数灵活度
@@ -40,11 +40,31 @@ POLICY_SELECT_IN_CHANNELS = 7
 POLICY_MAX_LEGAL_MOVES = 96
 # 策略「先起点后落点」：ICCS 9×10 展平为 90 格（下标 y*9+x）
 POLICY_GRID_NUMEL = 90
-# 棋局结果头：红方视角三分类（交叉熵类下标）；无标签时训练用 ignore_index
+# 棋谱 ``RecordResult`` 解析：红方视角三分类（仅用于从 ``Head`` 读入后再转换）
 RED_OUTCOME_WIN = 0
 RED_OUTCOME_DRAW = 1
 RED_OUTCOME_LOSS = 2
+# 价值网络输出 / 训练标签：**当前行棋方**视角胜 / 和 / 负（交叉熵类下标）
+STM_OUTCOME_WIN = 0
+STM_OUTCOME_DRAW = 1
+STM_OUTCOME_LOSS = 2
 VALUE_LABEL_IGNORE = -100
+
+
+def stm_outcome_class_from_red_outcome(red_cls: int, red_to_move: bool) -> int:
+    """
+    将棋谱终局的红方三分类 ``red_cls`` 转为**该步局面下行棋方**三分类。
+    类下标仍为 ``0=胜,1=和,2=负``，语义相对**轮到走的一方**。
+    """
+    if red_cls == VALUE_LABEL_IGNORE:
+        return VALUE_LABEL_IGNORE
+    if red_to_move:
+        return int(red_cls)
+    if red_cls == RED_OUTCOME_WIN:
+        return STM_OUTCOME_LOSS
+    if red_cls == RED_OUTCOME_LOSS:
+        return STM_OUTCOME_WIN
+    return STM_OUTCOME_DRAW
 
 
 def _fench_material_value(fench: str) -> float:
@@ -227,18 +247,13 @@ def _mobility_quality_plane(cb: ChessBoard, side: ChessSide) -> np.ndarray:
 
 def encode_rationale_planes(boardarr: np.ndarray, board_state: BaseChessBoard) -> np.ndarray:
     """
-    返回 (RATIONALE_PLANE_COUNT, 10, 9) float32，与 boardarr / 棋子平面同一坐标系
-    （再由 orient_planes_for_model 与棋子平面一起做 y 翻转）。
+    返回 (RATIONALE_PLANE_COUNT, 10, 9) float32，与 boardarr / 棋子平面同一**固定红方**坐标系。
     """
     pr = _palace_red_mask()
     pb = _palace_black_mask()
     terr_b = _black_territory_mask()
-    ms = board_state.move_side
-    turn_red = np.full(
-        (10, 9),
-        1.0 if ms is not None and ms == ChessSide.RED else 0.0,
-        dtype=np.float32,
-    )
+    # 不再编码「轮到谁走」：交互已隐含行棋方；此平面恒 0 以保留通道形状兼容。
+    turn_red = np.zeros((10, 9), dtype=np.float32)
     kr, kb = _king_planes(boardarr)
 
     chk = np.zeros((10, 9), dtype=np.float32)

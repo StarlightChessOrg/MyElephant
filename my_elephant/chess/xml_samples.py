@@ -26,6 +26,7 @@ from my_elephant.chess.rationale import (
     RED_OUTCOME_LOSS,
     RED_OUTCOME_WIN,
     VALUE_LABEL_IGNORE,
+    stm_outcome_class_from_red_outcome,
 )
 from my_elephant.chess.session import legal_moves_iccs_for_board
 
@@ -73,9 +74,8 @@ def successor_planes_for_legals(
         trial = bb.copy()
         assert trial.move(Pos(xa, ya), Pos(xb, yb)) is not None
         trial.next_turn()
-        red_after = trial.move_side is not ChessSide.BLACK
         boardarr = trial.get_board_arr()
-        enc = encode_model_planes(boardarr, red_after, trial, feature_list)
+        enc = encode_model_planes(boardarr, True, trial, feature_list)
         rows.append(enc.astype(np.float32, copy=False))
     return np.stack(rows, axis=0)
 
@@ -126,20 +126,17 @@ def red_outcome_class_from_head(head: Any) -> int:
 def convert_game(
     onefile: str | Path,
     feature_list: Mapping[str, list[str]],
-) -> Iterator[
-    tuple[np.ndarray, np.ndarray, np.ndarray, np.int64, np.int64, bool, int]
-]:
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.int64, np.int64, int]]:
     """
     逐步回放棋局。在棋谱着法执行前，用**走棋前当前局面**训练「先选起点格、再选落点格」两阶段策略头。
 
     Yields:
-        cur_hwc: (10, 9, C) float32，走棋前 ``encode_model_planes`` 转 HWC
+        cur_hwc: (10, 9, C) float32，走棋前 ``encode_model_planes`` 转 HWC（**固定红方棋盘视角**，不按行棋方翻转）
         src_mask: (90,) bool，可为起点的 ICCS 格（至少一着合法出发）
         dst_mask: (90,) bool，在**棋谱真实起点**下可达的落点格
         src_label: 起点展平下标 ``y*9+x``
         dst_label: 落点展平下标
-        red_to_move: 走棋**之前**是否轮到红方
-        outcome_cls: 红方胜/和/负类下标，或 ``VALUE_LABEL_IGNORE``
+        outcome_cls: **行棋方**胜/和/负三分类下标，或 ``VALUE_LABEL_IGNORE``（不由样本张量携带「轮到谁」）
     """
     doc = _load_record(onefile)
     head = doc["ChineseChessRecord"]["Head"]
@@ -157,7 +154,7 @@ def convert_game(
         red_to_move = bb.move_side is not ChessSide.BLACK
         boardarr_before = bb.get_board_arr()
         current_chw = encode_model_planes(
-            boardarr_before, red_to_move, bb, feature_list
+            boardarr_before, True, bb, feature_list
         ).astype(np.float32, copy=False)
         x1, y1, x2, y2 = parse_move_squares(mv)
         legals = sorted(legal_moves_iccs_for_board(bb))
@@ -175,12 +172,13 @@ def convert_game(
         assert moveresult is not None
         bb.next_turn()
 
+        value_cls = stm_outcome_class_from_red_outcome(outcome_cls, red_to_move)
+
         yield (
             cur_hwc.astype(np.float32, copy=False),
             src_mask,
             dst_mask,
             np.int64(li_s),
             np.int64(li_d),
-            red_to_move,
-            outcome_cls,
+            value_cls,
         )

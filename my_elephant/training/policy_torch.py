@@ -9,8 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cchess.piece import ChessSide
-
 from my_elephant.chess.features import encode_model_planes
 from my_elephant.chess.rationale import POLICY_GRID_NUMEL, POLICY_SELECT_IN_CHANNELS, VALUE_LABEL_IGNORE
 from my_elephant.chess.session import GamePlay
@@ -56,7 +54,7 @@ class SuccessorPolicy(nn.Module):
     共享 trunk 读走棋前当前局面 ``(B,C,10,9)``：
     - ``head_src``：90 维，选起点格（ICCS 展平 ``y*9+x``）；
     - ``head_dst``：在 teacher/推理给定起点 one-hot 拼接后，90 维选落点格；
-    - ``value_head``：红方胜/和/负三分类（与当前训练管线一致）。
+    - ``value_head``：**行棋方**胜/和/负三分类 logit（与棋谱经 ``stm_outcome_class_from_red_outcome`` 对齐）。
 
     卷积塔与 ``StarlightChessOrg/MyElephant`` 提交 ``91e27b25`` 中 ``SuccessorPolicy`` 一致：
     ``3×3 stem`` + ``num_res_layers`` 个 ``ResBlock`` + 全局平均池化；在此之上接两阶段策略头与价值头。
@@ -184,8 +182,8 @@ def _encode_gameplay_current_nchw(
     gameplay: GamePlay, flist: dict[str, list[str]], device: torch.device
 ) -> torch.Tensor:
     raw = np.asarray(gameplay.bb._board[::-1])
-    red_to = gameplay.bb.move_side is not ChessSide.BLACK
-    cur_chw = encode_model_planes(raw, red_to, gameplay.bb, flist)
+    # 固定红方物理视角；行棋方不进平面（由交互/规则隐含）
+    cur_chw = encode_model_planes(raw, True, gameplay.bb, flist)
     cur_hwc = np.transpose(cur_chw, (1, 2, 0))
     t = (
         torch.from_numpy(np.ascontiguousarray(np.expand_dims(cur_hwc, 0)))
@@ -239,7 +237,7 @@ def eval_policy_value_at_root(
 ) -> tuple[list[str], np.ndarray, float]:
     """
     MCTS 用：对当前局面枚举合法着法，用分解式 ``P(着)=P(起点)P(落点|起点)`` 得到与 ``legals`` 对齐的 prior，
-    并给出轮到方价值标量（由红方三分类经视角换算）。
+    并给出轮到方价值标量（由**行棋方**三分类 ``P(胜)-P(负)``，无需再按红黑翻转）。
     """
     legals_t = sorted(gameplay.legal_moves_iccs())
     if not legals_t:
@@ -285,9 +283,7 @@ def eval_policy_value_at_root(
         pri_arr /= s
     logits_v = model.value_head(feat)[0]
     pv = torch.softmax(logits_v.float(), dim=0).cpu().numpy()
-    v_red = float(pv[0] - pv[2])
-    red = gameplay.get_side() == "red"
-    v = v_red if red else -v_red
+    v = float(pv[0] - pv[2])
     return legals_s, pri_arr, v
 
 
@@ -298,7 +294,7 @@ def eval_value_side_to_move(
     device: torch.device,
     flist: dict[str, list[str]],
 ) -> float:
-    """轮到方视角的价值标量（约 ``[-1,1]``）：无着时将死为 ``-1``、否则和 ``0``；否则为价值头经视角换算。"""
+    """轮到方视角的价值标量（约 ``[-1,1]``）：无着时将死为 ``-1``、否则和 ``0``；否则为价值头 ``P(行棋方胜)-P(行棋方负)``。"""
     if not gameplay.legal_moves_iccs():
         from my_elephant.chess.board_utils import chess_board_from_base
 
@@ -311,9 +307,7 @@ def eval_value_side_to_move(
     feat = model._trunk_flat(x_cur)
     logits_v = model.value_head(feat)[0]
     pv = torch.softmax(logits_v.float(), dim=0)
-    v_red = float((pv[0] - pv[2]).item())
-    red = gameplay.get_side() == "red"
-    return float(v_red if red else -v_red)
+    return float((pv[0] - pv[2]).item())
 
 
 @torch.no_grad()
@@ -367,11 +361,9 @@ def infer_1ply_value_prior_move(
         feat_b = model._trunk_flat(xb)
         logits_v = model.value_head(feat_b)
         pv = torch.softmax(logits_v.float(), dim=1)
-        v_red = pv[:, 0] - pv[:, 2]
+        v_stm_child = pv[:, 0] - pv[:, 2]
         for j, orig_i in enumerate(batch_orig):
-            red = batch_gps[j].get_side() == "red"
-            v_stm = float(v_red[j].item()) if red else float(-v_red[j].item())
-            q_root[orig_i] = -v_stm
+            q_root[orig_i] = -float(v_stm_child[j].item())
 
     best_i = 0
     best_sc = -1e18

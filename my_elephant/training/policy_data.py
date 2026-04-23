@@ -69,16 +69,15 @@ def _policy_dataloader_worker_init(_worker_id: int) -> None:
 
 
 def collate_twohead_policy_value_batch(
-    batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.int64, np.int64, bool, int]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.int64, np.int64, int]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cur = np.stack([b[0] for b in batch], axis=0)
     msrc = np.stack([b[1] for b in batch], axis=0)
     mdst = np.stack([b[2] for b in batch], axis=0)
     ys = np.stack([np.int64(b[3]) for b in batch], axis=0)
     yd = np.stack([np.int64(b[4]) for b in batch], axis=0)
-    red = np.asarray([bool(b[5]) for b in batch], dtype=np.bool_)
-    yv = np.stack([np.int64(b[6]) for b in batch], axis=0)
-    return cur, msrc, mdst, ys, yd, red, yv
+    yv = np.stack([np.int64(b[5]) for b in batch], axis=0)
+    return cur, msrc, mdst, ys, yd, yv
 
 
 def _shard_filelist_for_worker(filelist: list[str]) -> list[str]:
