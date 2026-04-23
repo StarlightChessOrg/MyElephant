@@ -35,6 +35,10 @@ STRATEGY_MCTS = "MCTS+策略价值网络"
 STRATEGIES = (STRATEGY_HUMAN, STRATEGY_NEURAL, STRATEGY_MCTS)
 # ttk.Combobox 的 width 为字符宽度；略大于最长项以免「MCTS+策略价值网络」被裁切。
 _STRATEGY_COMBO_WIDTH = max(22, max(len(s) for s in STRATEGIES) + 6)
+# 状态栏 wraplength（像素）与固定字符宽度：避免「AI 思考中」短文案时右栏变窄、MCTS 结束后变宽。
+_STATUS_WRAPLENGTH_PX = 280
+# ttk.Label 的 width 为「平均字符」数，略大于 wrap 所需以免高 DPI 下仍抖动。
+_STATUS_LABEL_WIDTH_CHARS = 30
 
 # 棋子显示（红大写 / 黑小写 → 同一汉字，靠颜色区分）
 _PIECE_CHAR = {
@@ -151,7 +155,13 @@ class XiangqiTkApp:
         cb_b.bind("<<ComboboxSelected>>", lambda _e: master.after(50, self._maybe_schedule_ai))
 
         ttk.Button(right, text="新局", command=self._new_game).pack(fill=tk.X, pady=4)
-        self.status = ttk.Label(right, text="", wraplength=280)
+        self.status = ttk.Label(
+            right,
+            text="",
+            wraplength=_STATUS_WRAPLENGTH_PX,
+            width=_STATUS_LABEL_WIDTH_CHARS,
+            anchor=tk.W,
+        )
         self.status.pack(anchor=tk.W, pady=8)
 
         self._draw_static_grid()
