@@ -97,6 +97,8 @@ class XiangqiTkApp:
         c_puct: float,
         mcts_max_seconds: float | None = None,
         *,
+        mcts_workers: int | None = None,
+        mcts_virtual_loss: float = 3.0,
         neural_mode: str = "1ply",
         neural_prior_weight: float = 1.0,
         neural_value_weight: float = 1.0,
@@ -108,6 +110,8 @@ class XiangqiTkApp:
         self.mcts_sims = mcts_sims
         self.c_puct = c_puct
         self.mcts_max_seconds = mcts_max_seconds
+        self.mcts_workers = mcts_workers
+        self.mcts_virtual_loss = mcts_virtual_loss
         self.neural_mode = neural_mode
         self.neural_prior_weight = neural_prior_weight
         self.neural_value_weight = neural_value_weight
@@ -394,6 +398,8 @@ class XiangqiTkApp:
                         n_simulations=self.mcts_sims,
                         c_puct=self.c_puct,
                         max_seconds=self.mcts_max_seconds,
+                        virtual_loss=self.mcts_virtual_loss,
+                        n_workers=self.mcts_workers,
                     )
             except Exception as e:
                 err = str(e)
@@ -424,7 +430,8 @@ class XiangqiTkApp:
                 f"MCTS 玩法{mcts_st.n_playouts}/{mcts_st.requested_simulations} "
                 f"墙钟{mcts_st.elapsed_seconds:.3f}s 时限{tlim}\n"
                 f"网络展开{mcts_st.n_expansions} 根访问{mcts_st.root_total_visits} "
-                f"停止={mcts_st.stopped_by}"
+                f"停止={mcts_st.stopped_by} "
+                f"并行{mcts_st.parallel_workers}线程 VL={mcts_st.virtual_loss:g}"
             )
         if mv not in self._legal_strings():
             self._refresh_board()
@@ -457,8 +464,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--mcts-max-seconds",
         type=float,
+        default=5.0,
+        help="MCTS 墙钟时间上限（秒），默认 5；与 --mcts-sims 先到先停；<=0 表示不限时",
+    )
+    p.add_argument(
+        "--mcts-workers",
+        type=int,
         default=None,
-        help="MCTS 墙钟时间上限（秒）；与 --mcts-sims 先到先停；不设则仅按模拟次数",
+        help="MCTS 并行模拟线程数，默认等于 CPU 逻辑核心数；1 为单线程（无并行）",
+    )
+    p.add_argument(
+        "--mcts-virtual-loss",
+        type=float,
+        default=3.0,
+        help="多线程 MCTS 虚拟损失系数（仅 workers>1 时生效）",
     )
     p.add_argument("--c-puct", type=float, default=1.5, help="PUCT 探索系数")
     p.add_argument(
@@ -485,6 +504,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    mcts_max_seconds = None if args.mcts_max_seconds is not None and args.mcts_max_seconds <= 0 else float(args.mcts_max_seconds)
     if args.gpu < 0 or not torch.cuda.is_available():
         device = torch.device("cpu")
     else:
@@ -555,7 +575,9 @@ def main() -> None:
         flist,
         mcts_sims=args.mcts_sims,
         c_puct=args.c_puct,
-        mcts_max_seconds=args.mcts_max_seconds,
+        mcts_max_seconds=mcts_max_seconds,
+        mcts_workers=args.mcts_workers,
+        mcts_virtual_loss=args.mcts_virtual_loss,
         neural_mode=args.neural_mode,
         neural_prior_weight=args.neural_prior_weight,
         neural_value_weight=args.neural_value_weight,
