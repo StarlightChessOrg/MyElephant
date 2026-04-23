@@ -8,7 +8,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from cchess.piece import ChessSide
+
+from my_elephant.chess.features import encode_model_planes
 from my_elephant.chess.rationale import POLICY_SELECT_IN_CHANNELS, VALUE_LABEL_IGNORE
+from my_elephant.chess.session import GamePlay
+from my_elephant.chess.xml_samples import successor_planes_for_legals
 
 
 class ResBlock(nn.Module):
@@ -58,6 +63,7 @@ class SuccessorPolicy(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.score = nn.Linear(filters, 1)
         self.value_head = nn.Linear(filters, 3)
+        self.filters = filters
 
     def _trunk_flat(self, x_nchw: torch.Tensor) -> torch.Tensor:
         """``x_nchw``: (N, C, H, W) -> (N, filters)。"""
@@ -156,6 +162,49 @@ def value_accuracy_ignore(
         return torch.tensor(0.0, device=logits_3.device, dtype=torch.float32)
     pred = logits_3[m].argmax(dim=1)
     return (pred == target[m]).float().mean()
+
+
+def eval_policy_value_at_root(
+    gameplay: GamePlay,
+    model: SuccessorPolicy,
+    device: torch.device,
+    flist: dict[str, list[str]],
+) -> tuple[list[str], np.ndarray, float]:
+    """
+    在当前局面枚举合法着法，一次前向得到策略 prior 与价值标量。
+    返回 ``(走法字符串列表, 与列表对齐的 prior 概率, v)``，其中 ``v`` 为轮到走棋一方的期望得分
+    （胜≈1、负≈-1，由红方三分类 softmax 经视角换算）。
+    """
+    legals_t = sorted(gameplay.legal_moves_iccs())
+    if not legals_t:
+        return [], np.zeros(0, dtype=np.float32), 0.0
+    legals_s = [f"{a}{b}-{c}{d}" for (a, b, c, d) in legals_t]
+    planes_k = successor_planes_for_legals(gameplay.bb, legals_t, flist)
+    x_hwc = np.transpose(planes_k, (0, 2, 3, 1))
+    x = np.expand_dims(x_hwc, axis=0)
+    raw = np.asarray(gameplay.bb._board[::-1])
+    red_to = gameplay.bb.move_side is not ChessSide.BLACK
+    cur_chw = encode_model_planes(raw, red_to, gameplay.bb, flist)
+    cur_hwc = np.transpose(cur_chw, (1, 2, 0))
+    x_cur = (
+        torch.from_numpy(np.ascontiguousarray(np.expand_dims(cur_hwc, 0)))
+        .float()
+        .permute(0, 3, 1, 2)
+        .to(device)
+    )
+    xt = batched_successors_nhwc_to_torch(x, device)
+    model.eval()
+    with torch.no_grad():
+        logits_p, logits_v = model(xt, x_cur)
+    logits_p = logits_p[0]
+    logits_v = logits_v[0]
+    red = gameplay.get_side() == "red"
+    lr = logits_as_red_preference(logits_p, red)
+    priors = torch.softmax(lr.float(), dim=0).cpu().numpy()
+    pv = torch.softmax(logits_v.float(), dim=0).cpu().numpy()
+    v_red = float(pv[0] - pv[2])
+    v = v_red if red else -v_red
+    return legals_s, priors.astype(np.float64, copy=False), v
 
 
 def torch_load_checkpoint(path: str | Path, map_location: torch.device | str) -> dict:

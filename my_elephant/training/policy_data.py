@@ -1,8 +1,10 @@
-"""棋谱样本：`IterableDataset` + `DataLoader` 多进程预取 (后继平面, mask, 着法下标)。"""
+"""棋谱样本：`IterableDataset` + `DataLoader` 多进程并行解析与预取 (后继平面, mask, 着法下标)。"""
 from __future__ import annotations
 
 import math
+import os
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +78,18 @@ def _pad_one_sample(
     x_hwc = np.transpose(pad, (0, 2, 3, 1))
     cur_hwc = np.transpose(current_chw, (1, 2, 0))
     return x_hwc, mask, np.int64(label_idx), red_to_move, cur_hwc, np.int64(outcome_cls)
+
+
+def _policy_dataloader_worker_init(_worker_id: int) -> None:
+    """子进程内限制 BLAS/OpenMP 线程数，避免多 worker 与主训练线程抢核导致变慢。"""
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
 
 
 def collate_successor_policy_value_batch(
@@ -166,11 +180,18 @@ def make_policy_dataloader(
     num_workers: int = 4,
     pin_memory: bool = False,
     prefetch_factor: int = 4,
+    *,
+    drop_last: bool = False,
+    pin_memory_device: str | None = None,
 ) -> DataLoader:
     """
-    ``num_workers>0`` 时在子进程内解析棋谱、枚举着法，主进程组 batch 后送 GPU。
-    ``pin_memory=True``（CUDA 训练时建议）可与 ``non_blocking=True`` 拷贝配合。
-    ``prefetch_factor`` 为每个 worker 预取的 batch 数（仅 ``num_workers>0`` 时生效）。
+    使用 ``torch.utils.data.DataLoader`` 包装 ``IterableDataset``：
+
+    - ``num_workers>0``：多进程并行读盘、解析 XML、枚举合法着法；各 worker 按文件列表分片，
+      主进程异步 ``collate`` 组 batch，并通过 ``prefetch_factor`` 预取多个 batch。
+    - ``pin_memory=True``（CUDA）时建议配合训练端 ``non_blocking=True`` 拷贝；
+      若 PyTorch≥2.0 可传 ``pin_memory_device``（如 ``\"cuda:0\"``）进一步加速锁页内存路径。
+    - ``drop_last=True`` 时丢弃最后一个不满 ``batch_size`` 的 batch，利于稳定步时。
     """
     ds = SuccessorPolicyIterableDataset(sources)
     kw: dict[str, Any] = {
@@ -179,8 +200,63 @@ def make_policy_dataloader(
         "num_workers": num_workers,
         "collate_fn": collate_successor_policy_value_batch,
         "pin_memory": pin_memory,
+        "drop_last": drop_last,
     }
     if num_workers > 0:
         kw["persistent_workers"] = True
         kw["prefetch_factor"] = max(2, int(prefetch_factor))
+        kw["worker_init_fn"] = _policy_dataloader_worker_init
+        if sys.platform == "win32":
+            kw["multiprocessing_context"] = "spawn"
+    if pin_memory and pin_memory_device is not None:
+        try:
+            kw["pin_memory_device"] = pin_memory_device
+        except TypeError:
+            pass
     return DataLoader(**kw)
+
+
+def build_policy_train_val_loaders(
+    train_sources: PolicySources,
+    val_sources: PolicySources,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    pin_memory: bool,
+    pin_memory_device: str | None = None,
+    *,
+    train_drop_last: bool = True,
+    val_drop_last: bool = False,
+) -> tuple[DataLoader, DataLoader]:
+    """
+    构造训练 / 验证两个 ``DataLoader``，参数与 ``make_policy_dataloader`` 一致，
+    便于训练脚本集中配置并行与预取；默认训练 ``drop_last=True`` 以保持每步 batch 形状一致。
+    """
+    train_loader = make_policy_dataloader(
+        train_sources,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        drop_last=train_drop_last,
+        pin_memory_device=pin_memory_device,
+    )
+    val_loader = make_policy_dataloader(
+        val_sources,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        drop_last=val_drop_last,
+        pin_memory_device=pin_memory_device,
+    )
+    return train_loader, val_loader
+
+
+def default_num_workers(cap: int = 8) -> int:
+    """DataLoader 并行 worker 数的合理默认：不超过 ``cap``，且至少为 0。"""
+    try:
+        n = os.cpu_count() or 2
+    except NotImplementedError:
+        n = 2
+    return max(0, min(cap, n))

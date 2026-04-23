@@ -17,8 +17,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from my_elephant.datasets import ProgressBar
 from my_elephant.training.policy_data import (
+    build_policy_train_val_loaders,
+    default_num_workers,
     discover_cbf_files,
-    make_policy_dataloader,
     split_paths_train_test,
 )
 from my_elephant.chess.rationale import POLICY_SELECT_IN_CHANNELS, VALUE_LABEL_IGNORE
@@ -85,7 +86,18 @@ def _parse_args() -> argparse.Namespace:
         default=64,
         help="每步前向为 B×K 个子局面，显存紧张时可减小",
     )
-    p.add_argument("--num-res-layers", type=int, default=10)
+    p.add_argument(
+        "--num-res-layers",
+        type=int,
+        default=4,
+        help="残差块层数（默认较小以便 MCTS 多次前向）",
+    )
+    p.add_argument(
+        "--filters",
+        type=int,
+        default=64,
+        help="卷积宽度（默认约数 MB 级权重，利于 MCTS；旧 checkpoint 请与训练时一致）",
+    )
     p.add_argument("--gpu", type=int, default=0, help="GPU 编号；-1 表示 CPU")
     p.add_argument("--n-epochs", type=int, default=100)
     p.add_argument("--n-batch", type=int, default=10000)
@@ -117,8 +129,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--num-workers",
         type=int,
-        default=4,
-        help="DataLoader 子进程数（在 worker 里解析 XML、枚举合法着法）；0 表示主进程加载",
+        default=None,
+        help="DataLoader 子进程数（并行解析棋谱）；默认 min(8, CPU 核数)；0 表示主进程加载",
     )
     p.add_argument(
         "--prefetch-factor",
@@ -143,22 +155,69 @@ def _device(args: argparse.Namespace) -> torch.device:
 
 def main() -> None:
     args = _parse_args()
+    if args.num_workers is None:
+        args.num_workers = default_num_workers()
     device = _device(args)
     args.log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = args.model_dir / args.model_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt = torch_load_checkpoint(args.resume, device) if args.resume is not None else None
+    # 先在 CPU 上读权重，再在构建 DataLoader（多进程 fork/spawn）之后再 .to(cuda)，减轻 fork 后 CUDA 上下文问题
+    ckpt = (
+        torch_load_checkpoint(args.resume, torch.device("cpu"))
+        if args.resume is not None
+        else None
+    )
     if ckpt is not None:
         in_ch = (
             args.in_channels
             if args.in_channels is not None
             else int(ckpt.get("in_channels", ckpt.get("select_in_channels", POLICY_SELECT_IN_CHANNELS)))
         )
+        sd = ckpt.get("model", {})
+        if isinstance(sd, dict) and "stem_conv.weight" in sd:
+            inferred_f = int(sd["stem_conv.weight"].shape[0])
+            if ckpt.get("filters") is not None:
+                args.filters = int(ckpt["filters"])
+            else:
+                args.filters = inferred_f
+        if ckpt.get("num_res_layers") is not None:
+            args.num_res_layers = int(ckpt["num_res_layers"])
     else:
         in_ch = args.in_channels if args.in_channels is not None else POLICY_SELECT_IN_CHANNELS
 
-    model = SuccessorPolicy(num_res_layers=args.num_res_layers, in_channels=in_ch).to(device)
+    if args.cbf_root is not None:
+        all_cbf = discover_cbf_files(args.cbf_root, recursive=not args.cbf_shallow)
+        train_sources, test_sources = split_paths_train_test(
+            all_cbf, args.train_ratio, seed=args.data_seed
+        )
+        print(
+            f"[data] --cbf-root {args.cbf_root.resolve()}: "
+            f"{len(all_cbf)} .cbf -> train {len(train_sources)} / test {len(test_sources)}"
+        )
+    else:
+        train_sources, test_sources = args.train_list, args.test_list
+
+    pin_mem = device.type == "cuda"
+    pin_dev = str(device) if pin_mem else None
+    train_loader, test_loader = build_policy_train_val_loaders(
+        train_sources,
+        test_sources,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        pin_memory=pin_mem,
+        pin_memory_device=pin_dev,
+    )
+    if args.num_workers > 0:
+        print(
+            f"[data] DataLoader: num_workers={args.num_workers}, prefetch_factor={args.prefetch_factor}, "
+            f"pin_memory={pin_mem}, train_drop_last=True"
+        )
+
+    model = SuccessorPolicy(
+        num_res_layers=args.num_res_layers, in_channels=in_ch, filters=args.filters
+    ).to(device)
     optimizer = SGD(model.parameters(), lr=args.beginning_lr, momentum=0.9)
 
     epoch_begin = 0
@@ -186,33 +245,6 @@ def main() -> None:
 
     writer = SummaryWriter(log_dir=str(args.log_dir / f"{args.model_name}_torch"))
 
-    pin_mem = device.type == "cuda"
-    if args.cbf_root is not None:
-        all_cbf = discover_cbf_files(args.cbf_root, recursive=not args.cbf_shallow)
-        train_sources, test_sources = split_paths_train_test(
-            all_cbf, args.train_ratio, seed=args.data_seed
-        )
-        print(
-            f"[data] --cbf-root {args.cbf_root.resolve()}: "
-            f"{len(all_cbf)} .cbf -> train {len(train_sources)} / test {len(test_sources)}"
-        )
-    else:
-        train_sources, test_sources = args.train_list, args.test_list
-
-    train_loader = make_policy_dataloader(
-        train_sources,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=pin_mem,
-        prefetch_factor=args.prefetch_factor,
-    )
-    test_loader = make_policy_dataloader(
-        test_sources,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=pin_mem,
-        prefetch_factor=args.prefetch_factor,
-    )
     train_iter = iter(train_loader)
     test_iter = iter(test_loader)
 
@@ -382,6 +414,7 @@ def main() -> None:
             "epoch": epoch,
             "global_step": global_step,
             "num_res_layers": args.num_res_layers,
+            "filters": model.filters,
             "in_channels": model.in_channels,
             "val_loss": val_loss,
             "best_val_loss": best_val_loss,
