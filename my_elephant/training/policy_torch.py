@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import math
+import queue
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -229,28 +232,19 @@ def infer_greedy_move_string(
 
 
 @torch.no_grad()
-def eval_policy_value_at_root(
-    gameplay: GamePlay,
+def _root_prior_value_from_hidden_row(
+    feat: torch.Tensor,
+    ls_logits: torch.Tensor,
+    legals_t: list[tuple[int, int, int, int]],
     model: SuccessorPolicy,
     device: torch.device,
-    flist: dict[str, list[str]],
 ) -> tuple[list[str], np.ndarray, float]:
-    """
-    MCTS 用：对当前局面枚举合法着法，用分解式 ``P(着)=P(起点)P(落点|起点)`` 得到与 ``legals`` 对齐的 prior，
-    并给出轮到方价值标量（由**行棋方**三分类 ``P(胜)-P(负)``，无需再按红黑翻转）。
-    """
-    legals_t = sorted(gameplay.legal_moves_iccs())
-    if not legals_t:
-        return [], np.zeros(0, dtype=np.float64), 0.0
+    """单局面：已有 ``trunk`` 隐层与 ``head_src`` 一行 logits，完成落点头与价值，返回 ``(legals_s, pri_arr, v)``。"""
     legals_s = [f"{a}{b}-{c}{d}" for (a, b, c, d) in legals_t]
-    x_cur = _encode_gameplay_current_nchw(gameplay, flist, device)
-    model.eval()
-    feat = model._trunk_flat(x_cur)
-    ls = model.head_src(feat)[0]
     src_mask = torch.zeros(POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
     for x1, y1, _, _ in legals_t:
         src_mask[y1 * 9 + x1] = True
-    p_src = torch.softmax(ls.masked_fill(~src_mask, -1e9), dim=0)
+    p_src = torch.softmax(ls_logits.masked_fill(~src_mask, -1e9), dim=0)
     origins: list[tuple[int, int]] = []
     seen: set[tuple[int, int]] = set()
     for x1, y1, _, _ in legals_t:
@@ -285,6 +279,138 @@ def eval_policy_value_at_root(
     pv = torch.softmax(logits_v.float(), dim=0).cpu().numpy()
     v = float(pv[0] - pv[2])
     return legals_s, pri_arr, v
+
+
+@torch.no_grad()
+def batched_eval_policy_value_at_root(
+    gameplays: list[GamePlay],
+    model: SuccessorPolicy,
+    device: torch.device,
+    flist: dict[str, list[str]],
+) -> list[tuple[list[str], np.ndarray, float]]:
+    """
+    多根局面：共享一次 ``trunk`` + ``head_src`` 批前向，再逐局完成 ``head_dst`` 与价值（各局合法起点数不同，落点头仍按局批）。
+    与 ``eval_policy_value_at_root`` 数值一致；无合法着法的局面不占用 GPU。
+    """
+    n = len(gameplays)
+    if n == 0:
+        return []
+    legals_per: list[list[tuple[int, int, int, int]]] = []
+    nonempty: list[int] = []
+    for i, gp in enumerate(gameplays):
+        lt = sorted(gp.legal_moves_iccs())
+        legals_per.append(lt)
+        if lt:
+            nonempty.append(i)
+    out: list[tuple[list[str], np.ndarray, float] | None] = [None] * n
+    for i in range(n):
+        if not legals_per[i]:
+            out[i] = ([], np.zeros(0, dtype=np.float64), 0.0)
+    if not nonempty:
+        return [out[i] for i in range(n)]  # type: ignore[list-item]
+    model.eval()
+    xb = torch.cat(
+        [_encode_gameplay_current_nchw(gameplays[j], flist, device) for j in nonempty],
+        dim=0,
+    )
+    feat_b = model._trunk_flat(xb)
+    ls_b = model.head_src(feat_b)
+    for bi, j in enumerate(nonempty):
+        feat_row = feat_b[bi : bi + 1]
+        ls_row = ls_b[bi]
+        out[j] = _root_prior_value_from_hidden_row(
+            feat_row, ls_row, legals_per[j], model, device
+        )
+    return [out[i] for i in range(n)]  # type: ignore[list-item]
+
+
+@torch.no_grad()
+def eval_policy_value_at_root(
+    gameplay: GamePlay,
+    model: SuccessorPolicy,
+    device: torch.device,
+    flist: dict[str, list[str]],
+) -> tuple[list[str], np.ndarray, float]:
+    """
+    MCTS 用：对当前局面枚举合法着法，用分解式 ``P(着)=P(起点)P(落点|起点)`` 得到与 ``legals`` 对齐的 prior，
+    并给出轮到方价值标量（由**行棋方**三分类 ``P(胜)-P(负)``，无需再按红黑翻转）。
+    """
+    return batched_eval_policy_value_at_root([gameplay], model, device, flist)[0]
+
+
+class QueuedBatchedRootEvaluator:
+    """
+    单消费线程合并多路 MCTS 的根评估请求，在 CUDA 上对 ``trunk``+``head_src`` 做批前向，避免多线程并行调同一模型。
+    调用方在 ``eval_sync`` 上阻塞；须在线程池结束后再 ``close``（见对弈里 shutdown 顺序）。
+    """
+
+    _SENTINEL = object()
+
+    def __init__(
+        self,
+        model: SuccessorPolicy,
+        device: torch.device,
+        flist: dict[str, list[str]],
+        *,
+        max_batch: int = 16,
+        max_wait_s: float = 0.002,
+    ) -> None:
+        if device.type != "cuda":
+            raise ValueError("QueuedBatchedRootEvaluator 仅用于 CUDA 设备")
+        self._model = model
+        self._device = device
+        self._flist = flist
+        self._max_batch = max(1, int(max_batch))
+        self._max_wait_s = max(0.0, float(max_wait_s))
+        self._in_q: queue.Queue[tuple[GamePlay, queue.Queue] | object] = queue.Queue()
+        self._closed = False
+        self._thr = threading.Thread(target=self._consume_loop, name="batched-root-eval", daemon=True)
+        self._thr.start()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._in_q.put(self._SENTINEL)
+
+    def eval_sync(self, gp: GamePlay) -> tuple[list[str], np.ndarray, float]:
+        if self._closed:
+            raise RuntimeError("QueuedBatchedRootEvaluator 已关闭")
+        out_q: queue.Queue[object] = queue.Queue(maxsize=1)
+        self._in_q.put((gp, out_q))
+        result = out_q.get()
+        if isinstance(result, Exception):
+            raise result
+        return result  # type: ignore[return-value]
+
+    def _consume_loop(self) -> None:
+        while True:
+            first = self._in_q.get()
+            if first is self._SENTINEL:
+                break
+            batch: list[tuple[GamePlay, queue.Queue]] = [first]  # type: ignore[list-item]
+            deadline = time.perf_counter() + self._max_wait_s
+            while len(batch) < self._max_batch:
+                wait = deadline - time.perf_counter()
+                if wait <= 0:
+                    break
+                try:
+                    nxt = self._in_q.get(timeout=wait)
+                except queue.Empty:
+                    break
+                if nxt is self._SENTINEL:
+                    self._in_q.put(nxt)
+                    break
+                batch.append(nxt)  # type: ignore[arg-type]
+            gps = [b[0] for b in batch]
+            try:
+                outs = batched_eval_policy_value_at_root(gps, self._model, self._device, self._flist)
+            except Exception as e:
+                for _, rq in batch:
+                    rq.put(e)
+                continue
+            for (_, rq), o in zip(batch, outs):
+                rq.put(o)
 
 
 @torch.no_grad()

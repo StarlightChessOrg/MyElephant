@@ -2,6 +2,7 @@
 策略评估 HTTP 子进程入口：``python -m my_elephant.training.policy_eval_worker --checkpoint ... --port 17890``
 
 绑定 ``127.0.0.1``，提供 ``GET /health``、``POST /eval``（JSON ``{"fen": "..."}``）。
+默认 ``--gpu 0``：有 CUDA 时在 GPU 上前向；无 CUDA 或 ``--gpu -1`` 时用 CPU。
 """
 
 from __future__ import annotations
@@ -21,9 +22,20 @@ def main() -> None:
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--in-channels", type=int, default=None)
+    p.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+        help=">=0 且存在 CUDA 时使用 cuda:N；-1 强制 CPU",
+    )
     args = p.parse_args()
 
-    device = torch.device("cpu")
+    if args.gpu >= 0 and torch.cuda.is_available():
+        device = torch.device(f"cuda:{int(args.gpu)}")
+    else:
+        if args.gpu >= 0 and not torch.cuda.is_available():
+            print("[policy_eval_worker] 未检测到 CUDA，使用 CPU", flush=True)
+        device = torch.device("cpu")
     model, flist = load_successor_policy_for_play(
         args.checkpoint, device, in_channels=args.in_channels
     )

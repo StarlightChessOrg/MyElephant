@@ -1,4 +1,4 @@
-"""本地 HTTP 评估：父进程 MCTS 将局面 FEN POST 到子进程，子进程 CPU 上跑 ``eval_policy_value_at_root`` 等价的 prior+value。"""
+"""本地 HTTP 评估：父进程 MCTS 将局面 FEN POST 到子进程，子进程内跑 ``eval_policy_value_at_root``（优先 GPU，见 ``policy_eval_worker``）。"""
 
 from __future__ import annotations
 
@@ -109,6 +109,7 @@ def spawn_mcts_http_eval_cluster(
     *,
     in_channels: int | None,
     host: str = "127.0.0.1",
+    gpu: int = 0,
 ) -> tuple[list[subprocess.Popen], list[str]]:
     """启动 ``n_workers`` 个本机 HTTP 评估子进程（各占用 ``base_port+i``）。"""
     if n_workers <= 0:
@@ -134,6 +135,7 @@ def spawn_mcts_http_eval_cluster(
         ]
         if in_channels is not None:
             cmd += ["--in-channels", str(in_channels)]
+        cmd += ["--gpu", str(int(gpu))]
         p = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,

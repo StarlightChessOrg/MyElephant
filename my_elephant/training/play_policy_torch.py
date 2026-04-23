@@ -35,6 +35,7 @@ from my_elephant.training.policy_eval_http import (
     terminate_http_eval_cluster,
 )
 from my_elephant.training.policy_torch import (
+    QueuedBatchedRootEvaluator,
     SuccessorPolicy,
     eval_policy_value_at_root,
     infer_1ply_value_prior_move,
@@ -44,6 +45,16 @@ from my_elephant.training.policy_torch import (
 STRATEGY_HUMAN = "人类"
 STRATEGY_NEURAL = "纯网络"
 STRATEGY_MCTS = "MCTS+策略价值网络"
+
+
+def _select_play_device(gpu: int) -> torch.device:
+    """对弈推理：``gpu>=0`` 且可用 CUDA 时用 ``cuda:gpu``，否则 CPU（``gpu<0`` 为强制 CPU）。"""
+    if gpu < 0:
+        return torch.device("cpu")
+    if not torch.cuda.is_available():
+        print("[play] 未检测到 CUDA，推理使用 CPU", flush=True)
+        return torch.device("cpu")
+    return torch.device(f"cuda:{int(gpu)}")
 STRATEGIES = (STRATEGY_HUMAN, STRATEGY_NEURAL, STRATEGY_MCTS)
 # ttk.Combobox 的 width 为字符宽度；略大于最长项以免「MCTS+策略价值网络」被裁切。
 _STRATEGY_COMBO_WIDTH = max(22, max(len(s) for s in STRATEGIES) + 6)
@@ -118,6 +129,10 @@ class XiangqiTkApp:
         self.neural_mode = neural_mode
         self.neural_prior_weight = neural_prior_weight
         self.neural_value_weight = neural_value_weight
+        # 本地 CUDA：单消费线程合并根评估，批 ``trunk``+``head_src``；HTTP 评估子进程时不用
+        self._root_eval_batcher: QueuedBatchedRootEvaluator | None = None
+        if mcts_http_client is None and device.type == "cuda":
+            self._root_eval_batcher = QueuedBatchedRootEvaluator(model, device, flist)
         self.game = GamePlay()
         self.sel_from: tuple[int, int] | None = None
         self.last_move: tuple[int, int, int, int] | None = None
@@ -205,9 +220,15 @@ class XiangqiTkApp:
         except Exception:
             pass
 
+    def _shutdown_root_eval_batcher(self) -> None:
+        b, self._root_eval_batcher = self._root_eval_batcher, None
+        if b is not None:
+            b.close()
+
     def _shutdown_all_mcts_resources(self) -> None:
-        """先停 MCTS 线程池（等飞行中的 HTTP 评估结束），再关 HTTP 子进程。"""
+        """先停 MCTS 线程池（等飞行中的根评估结束），再关批评估队列，最后关 HTTP 子进程。"""
         self._shutdown_mcts_executor()
+        self._shutdown_root_eval_batcher()
         self._shutdown_mcts_http_workers()
 
     def _on_close_window(self) -> None:
@@ -443,10 +464,10 @@ class XiangqiTkApp:
                 else:
                     if self._mcts_http_client is not None:
                         ev = make_http_evaluator(self._mcts_http_client)
+                    elif self._root_eval_batcher is not None:
+                        ev = self._root_eval_batcher.eval_sync
                     else:
-
-                        def ev(gp: GamePlay):
-                            return eval_policy_value_at_root(gp, self.model, self.device, self.flist)
+                        ev = lambda gp: eval_policy_value_at_root(gp, self.model, self.device, self.flist)
 
                     mv, mcts_st, root_out = mcts_search(
                         g,
@@ -527,7 +548,7 @@ def _parse_args() -> argparse.Namespace:
         "--gpu",
         type=int,
         default=0,
-        help="已忽略：本对弈程序固定使用 CPU 加载权重与推理（小模型避免 GPU 往返开销）",
+        help="推理设备：>=0 且存在 CUDA 时使用 ``cuda:N``；无 CUDA 时自动回退 CPU；``-1`` 强制 CPU",
     )
     p.add_argument("--in-channels", type=int, default=None)
     p.add_argument(
@@ -592,8 +613,8 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     mcts_max_seconds = None if args.mcts_max_seconds is not None and args.mcts_max_seconds <= 0 else float(args.mcts_max_seconds)
-    _ = args.gpu  # 保留 CLI 兼容，对弈固定 CPU
-    device = torch.device("cpu")
+    device = _select_play_device(int(args.gpu))
+    print(f"[play] 推理设备: {device}", flush=True)
 
     mcts_workers_eff = args.mcts_workers
     if int(args.mcts_http_workers) > 0:
@@ -610,6 +631,7 @@ def main() -> None:
             int(args.mcts_http_workers),
             int(args.mcts_http_base_port),
             in_channels=args.in_channels,
+            gpu=int(args.gpu),
         )
         mcts_http_client = PolicyHTTPEvalClient(http_urls)
 
