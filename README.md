@@ -59,8 +59,9 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 
 ### 默认模型规模（便于 MCTS 多次前向）
 
-- **`--num-res-layers`** 默认 **4**，**`--filters`** 默认 **64**（权重约数 MB 量级；旧 checkpoint 请与训练时一致或从 ckpt 自动推断）。
-- Checkpoint 中保存 **`filters`**、**`num_res_layers`**；`--resume` 时会与权重形状对齐。
+- **主干默认 `transformer`**：棋盘 **10×9** 展成 **90 个 token**，通道线性嵌入为 **`d_model = --filters`**（默认 **64**），再接 **`--num-res-layers`** 层 `TransformerEncoder`（默认 **4**）、**多头自注意力**（`--nhead` 默认自动取能整除 `d_model` 的值）、FFN 宽度 **`--dim-feedforward`**（默认 **max(128, 4×filters)**）。参数量级与原先 **4×64 ResNet** 塔相近；若续训旧 **仅含 `stem_conv` 的权重** 会自动切回 **`--backbone resnet`**。
+- **可选 `--backbone resnet`**：保留原 **3×3 卷积 + 残差块** 塔（与最早期 checkpoint 键名一致）。
+- Checkpoint 中保存 **`backbone`**、**`filters`**、**`num_res_layers`**，Transformer 另存 **`nhead`**、**`dim_feedforward`**；`--resume` 时会与权重对齐并尽量从权重推断缺失字段。
 
 ### 常用参数
 
@@ -68,6 +69,8 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 |------|------|
 | `--cbf-root` | 数据集根目录，自动搜 `.cbf` 并划分 train/val |
 | `--batch-size` | 每步 batch 大小 |
+| `--backbone` | `transformer`（默认）或 `resnet` |
+| `--nhead` / `--dim-feedforward` / `--transformer-dropout` | 仅 Transformer：注意力头数、FFN 宽度、dropout |
 | `--num-workers` | `DataLoader` 子进程数；**默认** `min(8, CPU 核数)`，`0` 表示主进程加载 |
 | `--prefetch-factor` | 每 worker 预取 batch 数（`num_workers>0` 时） |
 | `--value-loss-weight` | 价值头 CE 相对策略损失（起点 CE + 落点 CE）的权重（默认 `0.5`） |
