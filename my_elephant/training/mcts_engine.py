@@ -1,7 +1,8 @@
 """PUCT 式 MCTS，配合策略（起点/落点）+ 价值网络选着。
 
-并行：默认按 CPU 逻辑核心数启动工作线程，在持锁的快速选路阶段之外并发调用 ``evaluator``（网络前向），
-以缩短墙钟；搜索树在单进程内共享，故使用**线程池**而非多进程树搜索。可传入**常驻** ``thread_pool``（由对弈界面创建、退出时 ``shutdown``），避免每局 MCTS 反复创建执行器。
+并行：默认按 CPU 逻辑核心数启动工作线程，在持锁的快速选路阶段之外并发调用 ``evaluator``。
+若 ``evaluator`` 经本地 HTTP 转到子进程（见 ``policy_eval_http``），则网络前向在**多进程**上执行，父进程仅持搜索树。
+可传入**常驻** ``thread_pool``（由对弈界面创建、退出时 ``shutdown``），避免每局 MCTS 反复创建线程池。
 
 虚拟损失：沿路径选边时对 ``(parent, action)`` 增加 ``parent.in_flight[action]``；PUCT 中
 ``Q ≈ (W - virtual_loss * inflight) / (N + inflight)``；备份后递减，减轻多线程挤占同一路径。

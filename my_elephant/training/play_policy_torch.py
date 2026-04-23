@@ -8,28 +8,32 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
+import subprocess
 import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from tkinter import messagebox, ttk
 
 import numpy as np
 import torch
 
-from my_elephant.chess import FEATURE_LIST, GamePlay
+from my_elephant.chess import GamePlay
 from my_elephant.chess.features import parse_move_squares
-from my_elephant.chess.rationale import POLICY_SELECT_IN_CHANNELS
+
 from my_elephant.training.mcts_engine import MCTSSearchStats, copy_gameplay, mcts_search
+from my_elephant.training.play_model_loader import load_successor_policy_for_play
+from my_elephant.training.policy_eval_http import (
+    PolicyHTTPEvalClient,
+    make_http_evaluator,
+    spawn_mcts_http_eval_cluster,
+    terminate_http_eval_cluster,
+)
 from my_elephant.training.policy_torch import (
     SuccessorPolicy,
-    count_hybrid_stem_res_blocks_in_state,
-    count_transformer_encoder_layers_in_state,
-    default_transformer_nhead,
     eval_policy_value_at_root,
     infer_1ply_value_prior_move,
     infer_greedy_move_string,
-    torch_load_checkpoint,
 )
 
 STRATEGY_HUMAN = "人类"
@@ -62,19 +66,6 @@ _PIECE_CHAR = {
 }
 
 
-def _infer_filters_from_state(sd: dict) -> int:
-    w = sd.get("hybrid_trunk.stem_conv.weight")
-    if w is not None:
-        return int(w.shape[0])
-    w = sd.get("xfm_trunk.in_proj.weight")
-    if w is not None:
-        return int(w.shape[0])
-    w = sd.get("stem_conv.weight")
-    if w is not None:
-        return int(w.shape[0])
-    return 64
-
-
 def _piece_side(ch: str | None) -> str | None:
     if not ch:
         return None
@@ -102,6 +93,8 @@ class XiangqiTkApp:
         *,
         mcts_workers: int | None = None,
         mcts_virtual_loss: float = 3.0,
+        mcts_http_client: PolicyHTTPEvalClient | None = None,
+        mcts_http_procs: list[subprocess.Popen] | None = None,
         neural_mode: str = "1ply",
         neural_prior_weight: float = 1.0,
         neural_value_weight: float = 1.0,
@@ -115,6 +108,8 @@ class XiangqiTkApp:
         self.mcts_max_seconds = mcts_max_seconds
         self.mcts_workers = mcts_workers
         self.mcts_virtual_loss = mcts_virtual_loss
+        self._mcts_http_client = mcts_http_client
+        self._mcts_http_procs = list(mcts_http_procs) if mcts_http_procs else []
         self.neural_mode = neural_mode
         self.neural_prior_weight = neural_prior_weight
         self.neural_value_weight = neural_value_weight
@@ -182,6 +177,12 @@ class XiangqiTkApp:
 
         master.protocol("WM_DELETE_WINDOW", self._on_close_window)
 
+    def _shutdown_mcts_http_workers(self) -> None:
+        """终止多进程 HTTP 评估子进程（可重复调用）。"""
+        procs, self._mcts_http_procs = self._mcts_http_procs, []
+        if procs:
+            terminate_http_eval_cluster(procs)
+
     def _shutdown_mcts_executor(self) -> None:
         """关闭 MCTS 常驻线程池（窗口关闭或进程退出时调用；可重复调用）。"""
         ex, self._mcts_executor = self._mcts_executor, None
@@ -192,8 +193,13 @@ class XiangqiTkApp:
         except Exception:
             pass
 
-    def _on_close_window(self) -> None:
+    def _shutdown_all_mcts_resources(self) -> None:
+        """先停 MCTS 线程池（等飞行中的 HTTP 评估结束），再关 HTTP 子进程。"""
         self._shutdown_mcts_executor()
+        self._shutdown_mcts_http_workers()
+
+    def _on_close_window(self) -> None:
+        self._shutdown_all_mcts_resources()
         self.master.destroy()
 
     def _iccs_center(self, ix: int, iy: int) -> tuple[float, float]:
@@ -413,9 +419,12 @@ class XiangqiTkApp:
                             value_weight=self.neural_value_weight,
                         )
                 else:
+                    if self._mcts_http_client is not None:
+                        ev = make_http_evaluator(self._mcts_http_client)
+                    else:
 
-                    def ev(gp: GamePlay):
-                        return eval_policy_value_at_root(gp, self.model, self.device, self.flist)
+                        def ev(gp: GamePlay):
+                            return eval_policy_value_at_root(gp, self.model, self.device, self.flist)
 
                     mv, mcts_st = mcts_search(
                         g,
@@ -510,6 +519,18 @@ def _parse_args() -> argparse.Namespace:
         default=3.0,
         help="多线程 MCTS 虚拟损失系数（仅 workers>1 时生效）",
     )
+    p.add_argument(
+        "--mcts-http-workers",
+        type=int,
+        default=0,
+        help=">0 时启动等量本机 HTTP 子进程做策略评估（127.0.0.1），父进程 MCTS 经 HTTP 分发以利用多核 CPU",
+    )
+    p.add_argument(
+        "--mcts-http-base-port",
+        type=int,
+        default=17890,
+        help="HTTP 评估子进程监听端口起始（每进程 +1）",
+    )
     p.add_argument("--c-puct", type=float, default=1.5, help="PUCT 探索系数")
     p.add_argument(
         "--neural-mode",
@@ -538,62 +559,28 @@ def main() -> None:
     mcts_max_seconds = None if args.mcts_max_seconds is not None and args.mcts_max_seconds <= 0 else float(args.mcts_max_seconds)
     _ = args.gpu  # 保留 CLI 兼容，对弈固定 CPU
     device = torch.device("cpu")
-    ckpt = torch_load_checkpoint(args.checkpoint, device)
-    sd = ckpt["model"]
-    backbone = str(ckpt.get("backbone", "")).lower()
-    if backbone not in ("hybrid", "transformer", "resnet"):
-        if any(k.startswith("hybrid_trunk.") for k in sd):
-            backbone = "hybrid"
-        elif any(k.startswith("xfm_trunk.") for k in sd):
-            backbone = "transformer"
-        else:
-            backbone = "resnet"
-    filters = int(ckpt.get("filters", _infer_filters_from_state(sd)))
-    num_res = int(ckpt.get("num_res_layers", 0))
-    if num_res <= 0 and backbone in ("transformer", "hybrid"):
-        pref = (
-            "hybrid_trunk.encoder.layers."
-            if backbone == "hybrid"
-            else "xfm_trunk.encoder.layers."
-        )
-        num_res = count_transformer_encoder_layers_in_state(sd, pref) or 4
-    elif num_res <= 0:
-        num_res = 4
-    in_ch = int(
-        ckpt.get("in_channels", ckpt.get("select_in_channels", args.in_channels or POLICY_SELECT_IN_CHANNELS))
-    )
-    stem_rb = ckpt.get("stem_res_blocks")
-    if stem_rb is not None:
-        stem_rb = int(stem_rb)
-    elif backbone == "hybrid":
-        stem_rb = max(0, count_hybrid_stem_res_blocks_in_state(sd))
-    else:
-        stem_rb = 2
-    nhead = ckpt.get("nhead")
-    dim_ff = ckpt.get("dim_feedforward")
-    if backbone in ("transformer", "hybrid"):
-        if nhead is None:
-            nhead = default_transformer_nhead(filters)
-        else:
-            nhead = int(nhead)
-        if dim_ff is not None:
-            dim_ff = int(dim_ff)
-    model = SuccessorPolicy(
-        num_res_layers=num_res,
-        in_channels=in_ch,
-        filters=filters,
-        backbone=backbone,
-        stem_res_blocks=stem_rb,
-        nhead=int(nhead) if backbone in ("transformer", "hybrid") and nhead is not None else nhead,
-        dim_feedforward=dim_ff,
-    ).to(device)
-    model.load_state_dict(sd, strict=False)
-    model.eval()
 
-    flist: dict[str, list[str]] = {
-        "red": list(FEATURE_LIST["red"]),
-        "black": list(FEATURE_LIST["black"]),
-    }
+    mcts_workers_eff = args.mcts_workers
+    if int(args.mcts_http_workers) > 0:
+        if mcts_workers_eff is None:
+            mcts_workers_eff = min(64, max(int(args.mcts_http_workers), os.cpu_count() or 1))
+        elif mcts_workers_eff <= 1:
+            mcts_workers_eff = max(2, min(int(args.mcts_http_workers), os.cpu_count() or 2))
+
+    mcts_http_procs: list[subprocess.Popen] = []
+    mcts_http_client: PolicyHTTPEvalClient | None = None
+    if int(args.mcts_http_workers) > 0:
+        mcts_http_procs, http_urls = spawn_mcts_http_eval_cluster(
+            args.checkpoint,
+            int(args.mcts_http_workers),
+            int(args.mcts_http_base_port),
+            in_channels=args.in_channels,
+        )
+        mcts_http_client = PolicyHTTPEvalClient(http_urls)
+
+    model, flist = load_successor_policy_for_play(
+        args.checkpoint, device, in_channels=args.in_channels
+    )
 
     root = tk.Tk()
     app = XiangqiTkApp(
@@ -604,13 +591,15 @@ def main() -> None:
         mcts_sims=args.mcts_sims,
         c_puct=args.c_puct,
         mcts_max_seconds=mcts_max_seconds,
-        mcts_workers=args.mcts_workers,
+        mcts_workers=mcts_workers_eff,
         mcts_virtual_loss=args.mcts_virtual_loss,
+        mcts_http_client=mcts_http_client,
+        mcts_http_procs=mcts_http_procs,
         neural_mode=args.neural_mode,
         neural_prior_weight=args.neural_prior_weight,
         neural_value_weight=args.neural_value_weight,
     )
-    atexit.register(app._shutdown_mcts_executor)
+    atexit.register(app._shutdown_all_mcts_resources)
     root.after(200, app._maybe_schedule_ai)
     root.mainloop()
 
