@@ -154,7 +154,7 @@ class XiangqiTkApp:
         cb_b.pack(anchor=tk.W, pady=(0, 8))
         cb_b.bind("<<ComboboxSelected>>", lambda _e: master.after(50, self._maybe_schedule_ai))
 
-        ttk.Button(right, text="新局", command=self._new_game).pack(fill=tk.X, pady=4)
+        ttk.Button(right, text="新局", command=self._new_game).pack(anchor=tk.W, pady=4)
         self.status = ttk.Label(
             right,
             text="",
@@ -279,8 +279,11 @@ class XiangqiTkApp:
             )
 
         side = "红方" if self.game.get_side() == "red" else "黑方"
-        extra = f" | {self._last_mcts_info}" if self._last_mcts_info else ""
-        self.status.config(text=f"轮到 {side} 走棋{extra}")
+        head = f"轮到 {side} 走棋"
+        if self._last_mcts_info:
+            self.status.config(text=f"{head}\n{self._last_mcts_info}")
+        else:
+            self.status.config(text=head)
 
     def _pixel_to_iccs(self, px: float, py: float) -> tuple[int, int] | None:
         """点击映射到最近的交叉点（与棋子落点一致）。"""
@@ -419,7 +422,7 @@ class XiangqiTkApp:
             )
             self._last_mcts_info = (
                 f"MCTS 玩法{mcts_st.n_playouts}/{mcts_st.requested_simulations} "
-                f"墙钟{mcts_st.elapsed_seconds:.3f}s 时限{tlim} "
+                f"墙钟{mcts_st.elapsed_seconds:.3f}s 时限{tlim}\n"
                 f"网络展开{mcts_st.n_expansions} 根访问{mcts_st.root_total_visits} "
                 f"停止={mcts_st.stopped_by}"
             )
