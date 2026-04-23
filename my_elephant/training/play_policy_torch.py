@@ -102,8 +102,12 @@ class XiangqiTkApp:
         master.title("MyElephant 象棋对弈")
         self.CELL = 52
         self.OFF = 36
-        self.CW = self.OFF * 2 + self.CELL * 8 + 1
-        self.CH = self.OFF * 2 + self.CELL * 9 + 1
+        # 棋子圆半径 r = CELL//2 - 4；最底行中心 y = OFF + 9*CELL + CELL/2，最右列 x = OFF + 8*CELL + CELL/2，
+        # 外接圆会超出原先 OFF*2 + 8/9*CELL 的估算，导致底边（及窄屏时右边）被裁切。
+        _r = self.CELL // 2 - 4
+        _pad = 6
+        self.CW = int(self.OFF * 2 + 8 * self.CELL + self.CELL // 2 + _r + _pad)
+        self.CH = int(self.OFF * 2 + 9 * self.CELL + self.CELL // 2 + _r + _pad)
 
         main = ttk.Frame(master, padding=6)
         main.pack(fill=tk.BOTH, expand=True)
@@ -142,19 +146,63 @@ class XiangqiTkApp:
         cy = self.OFF + iy * self.CELL + h
         return cx, cy
 
-    def _draw_static_grid(self) -> None:
+    def _draw_traverse_mark(self, cx: float, cy: float) -> None:
+        """炮位、卒林等传统「花心」：交叉短线。"""
+        h = max(6, self.CELL // 7)
         c = self.canvas
+        w, t = "#4a3225", "grid"
+        c.create_line(cx - h, cy, cx + h, cy, fill=w, width=1, tags=t)
+        c.create_line(cx, cy - h, cx, cy + h, fill=w, width=1, tags=t)
+
+    def _draw_static_grid(self) -> None:
+        """传统棋盘：外框、10 横 9 纵（河界断竖线）、九宫斜线、炮位/卒林花心、楚河汉界。"""
+        c = self.canvas
+        o = self.OFF
+        u = self.CELL
+        x0, x1 = o, o + 8 * u
+        y0, y1 = o, o + 9 * u
+        col = "#4a3225"
+        t = "grid"
+        # 河界：第 5、6 条横线之间无纵线（iy=4 与 iy=5 之间）
+        y_river_top = o + 4 * u
+        y_river_bot = o + 5 * u
+
+        c.create_rectangle(x0, y0, x1, y1, outline=col, width=2, tags=t)
         for i in range(10):
-            y = self.OFF + i * self.CELL
-            c.create_line(self.OFF, y, self.OFF + 8 * self.CELL, y, fill="#5c4033", width=1)
+            y = o + i * u
+            c.create_line(x0, y, x1, y, fill=col, width=1, tags=t)
         for i in range(9):
-            x = self.OFF + i * self.CELL
-            y0, y1 = self.OFF, self.OFF + 9 * self.CELL
-            c.create_line(x, y0, x, y1, fill="#5c4033", width=1)
-        # 河界
-        rx0, ry = self.OFF, self.OFF + 4 * self.CELL + self.CELL // 2
-        c.create_text(rx0 + 2 * self.CELL, ry, text="楚 河", fill="#6b5344", font=("Microsoft YaHei", 11))
-        c.create_text(rx0 + 6 * self.CELL, ry, text="漢 界", fill="#6b5344", font=("Microsoft YaHei", 11))
+            x = o + i * u
+            if i in (0, 8):
+                # 边线纵贯河界（与传统木盘一致）
+                c.create_line(x, y0, x, y1, fill=col, width=1, tags=t)
+            else:
+                c.create_line(x, y0, x, y_river_top, fill=col, width=1, tags=t)
+                c.create_line(x, y_river_bot, x, y1, fill=col, width=1, tags=t)
+
+        def line_ij(ix_a: int, iy_a: int, ix_b: int, iy_b: int) -> None:
+            ax, ay = self._iccs_center(ix_a, iy_a)
+            bx, by = self._iccs_center(ix_b, iy_b)
+            c.create_line(ax, ay, bx, by, fill=col, width=1, tags=t)
+
+        # 黑方九宫（顶中 iy 0–2）
+        line_ij(3, 0, 5, 2)
+        line_ij(5, 0, 3, 2)
+        # 红方九宫（底中 iy 7–9）
+        line_ij(3, 7, 5, 9)
+        line_ij(5, 7, 3, 9)
+
+        for ix, iy in ((1, 2), (7, 2), (1, 7), (7, 7)):
+            self._draw_traverse_mark(*self._iccs_center(ix, iy))
+        for ix in (0, 2, 4, 6, 8):
+            self._draw_traverse_mark(*self._iccs_center(ix, 3))
+        for ix in (0, 2, 4, 6, 8):
+            self._draw_traverse_mark(*self._iccs_center(ix, 6))
+
+        ry = o + 4 * u + u // 2
+        font = ("Microsoft YaHei", 13, "bold")
+        c.create_text(o + 2 * u, ry, text="楚 河", fill="#5d4037", font=font, tags=t)
+        c.create_text(o + 6 * u, ry, text="漢 界", fill="#5d4037", font=font, tags=t)
 
     def _raw_board(self) -> np.ndarray:
         return np.asarray(self.game.bb._board[::-1])
