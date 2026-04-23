@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from my_elephant.chess.board_utils import chess_board_from_base
+from my_elephant.chess.mcts_prior_shaping import tactical_boost_priors
 from my_elephant.chess.session import GamePlay
 
 
@@ -150,14 +151,15 @@ def _puct_select(node: _MCTSNode, c_puct: float, virtual_loss: float) -> str:
 
 
 def _apply_expand(node: _MCTSNode, legals_s: list[str], priors: np.ndarray) -> None:
-    """将 ``evaluator`` 结果写入节点（不再次调用网络）。"""
+    """将 ``evaluator`` 结果写入节点（不再次调用网络）；先验经将军 / MVV-LVA 吃子 加权后再归一化。"""
     if not legals_s:
         return
-    s = float(np.sum(priors))
+    shaped = tactical_boost_priors(node.gp, legals_s, priors)
+    s = float(np.sum(shaped))
     if s <= 0:
         p = {m: 1.0 / len(legals_s) for m in legals_s}
     else:
-        p = {m: float(priors[i]) / s for i, m in enumerate(legals_s)}
+        p = {m: float(shaped[i]) / s for i, m in enumerate(legals_s)}
     node.P = p
     for m in legals_s:
         child = copy_gameplay(node.gp)
