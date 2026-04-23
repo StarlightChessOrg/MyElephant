@@ -223,12 +223,12 @@ class SuccessorPolicy(nn.Module):
 
     def __init__(
         self,
-        num_res_layers: int = 10,
+        num_res_layers: int = 8,
         in_channels: int | None = None,
-        filters: int = 256,
+        filters: int = 224,
         grid: int = POLICY_GRID_NUMEL,
         backbone: str = "hybrid",
-        stem_res_blocks: int = 2,
+        stem_res_blocks: int = 3,
         nhead: int | None = None,
         dim_feedforward: int | None = None,
         transformer_dropout: float = 0.05,

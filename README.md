@@ -57,9 +57,9 @@ python -m my_elephant.training.train_policy_torch --model-name my_run
 python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 ```
 
-### 默认模型规模（便于 MCTS 多次前向）
+### 默认模型规模（约 30MB 级 checkpoint）
 
-- **主干默认 `hybrid`（卷积 + Transformer）**：先用 **3×3 stem + `--stem-res-blocks` 个 ResBlock**（默认 **2**）在 **10×9** 格网上把稀疏平面编码成 **每格 `filters` 维** 的稠密特征，再展平为 **90 个 token**，加位置编码后接 **`--num-res-layers`** 层 `TransformerEncoder`（默认 **4**）、`--nhead` / `--dim-feedforward` 与纯 Transformer 相同语义。意图：局部形貌由卷积归纳，全局关系由自注意力建模。
+- **主干默认 `hybrid`（卷积 + Transformer）**：先用 **3×3 stem + `--stem-res-blocks` 个 ResBlock**（默认 **3**）在 **10×9** 格网上把稀疏平面编码成 **每格 `filters` 维** 的稠密特征，再展平为 **90 个 token**，加位置编码后接 **`--num-res-layers`** 层 `TransformerEncoder`（默认 **8**）、`--filters` 默认 **224**（`--nhead` / `--dim-feedforward` 与纯 Transformer 相同语义；`dim_feedforward` 未指定时为 `max(128, 4×filters)`）。意图：局部形貌由卷积归纳，全局关系由自注意力建模。单文件 `best.pt`/`last.pt`（含 SGD 动量缓冲）约 **30MB** 量级；纯推理仅需权重时可只分发 `state_dict` 或自行导出更小格式。
 - **`--backbone transformer`**：原始通道直接线性嵌入 token + Transformer（无前置 ResBlock）。
 - **`--backbone resnet`**：仅 **3×3 卷积 + 残差块** 塔 + GAP（与仅含顶层 `stem_conv` / `blocks` 的旧 checkpoint 一致）。
 - Checkpoint 保存 **`backbone`**、**`filters`**、**`num_res_layers`**；含 Transformer 时另存 **`nhead`**、**`dim_feedforward`**；`hybrid` 另存 **`stem_res_blocks`**。`--resume` 时按权重键名推断 **`hybrid_trunk.*` / `xfm_trunk.*` / 顶层 `stem_conv`**。
@@ -71,7 +71,7 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 | `--cbf-root` | 数据集根目录，自动搜 `.cbf` 并划分 train/val |
 | `--batch-size` | 每步 batch 大小 |
 | `--backbone` | `hybrid`（默认）、`transformer` 或 `resnet` |
-| `--stem-res-blocks` | 仅 hybrid：卷积段 ResBlock 数（默认 `2`，`0` 表示仅 stem） |
+| `--stem-res-blocks` | 仅 hybrid：卷积段 ResBlock 数（默认 `3`，`0` 表示仅 stem） |
 | `--nhead` / `--dim-feedforward` / `--transformer-dropout` | hybrid/transformer：注意力头数、FFN、dropout |
 | `--num-workers` | `DataLoader` 子进程数；**默认** `min(8, CPU 核数)`，`0` 表示主进程加载 |
 | `--prefetch-factor` | 每 worker 预取 batch 数（`num_workers>0` 时） |

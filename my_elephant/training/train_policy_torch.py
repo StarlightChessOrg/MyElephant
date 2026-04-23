@@ -90,13 +90,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--num-res-layers",
         type=int,
-        default=4,
-        help="主干深度：ResNet 时为残差块数；hybrid/transformer 时为 Transformer encoder 层数（默认较小以便 MCTS 多次前向）",
+        default=8,
+        help="主干深度：ResNet 时为残差块数；hybrid/transformer 时为 Transformer encoder 层数（默认与 ~30MB 级权重配套；MCTS 前向多时可酌减）",
     )
     p.add_argument(
         "--filters",
         type=int,
-        default=64,
+        default=224,
         help="ResNet 时为卷积宽度；hybrid/transformer 时为卷积宽度及 Transformer d_model（旧 checkpoint 请与训练时一致）",
     )
     p.add_argument(
@@ -109,9 +109,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--stem-res-blocks",
         type=int,
-        default=2,
+        default=3,
         dest="stem_res_blocks",
-        help="仅 hybrid：卷积段 ResBlock 层数（默认 2；0 表示仅 stem 后接 Transformer）",
+        help="仅 hybrid：卷积段 ResBlock 层数（默认 3；0 表示仅 stem 后接 Transformer）",
     )
     p.add_argument(
         "--nhead",
