@@ -16,28 +16,8 @@ from my_elephant.chess.rationale import POLICY_GRID_NUMEL, POLICY_SELECT_IN_CHAN
 from my_elephant.chess.session import GamePlay
 
 
-def build_transformer_encoder(
-    enc_layer: nn.TransformerEncoderLayer, num_layers: int
-) -> nn.TransformerEncoder:
-    """``norm_first=True`` 时 PyTorch 会放弃 nested tensor 并告警；显式关闭以消除该 UserWarning。"""
-    try:
-        return nn.TransformerEncoder(enc_layer, num_layers, enable_nested_tensor=False)
-    except TypeError:
-        return nn.TransformerEncoder(enc_layer, num_layers)
-
-
-def default_transformer_nhead(d_model: int) -> int:
-    """取能整除 ``d_model`` 且单头维度不过小的注意力头数。"""
-    for h in (8, 6, 4, 2):
-        if d_model % h == 0 and d_model // h >= 8:
-            return h
-    for h in (8, 6, 4, 2, 1):
-        if d_model % h == 0:
-            return h
-    return 1
-
-
-def count_transformer_encoder_layers_in_state(sd: dict, prefix: str = "xfm_trunk.encoder.layers.") -> int:
+def count_resnet_blocks_in_state(sd: dict, prefix: str = "blocks.") -> int:
+    """从 ``state_dict`` 键名推断 ``Sequential`` 残差块个数（与 ``stem_conv`` + ``blocks`` + ``pool`` 塔一致）。"""
     mx = -1
     for k in sd:
         if not k.startswith(prefix):
@@ -71,129 +51,39 @@ class ResBlock(nn.Module):
         return out
 
 
-class TransformerBoardTrunk(nn.Module):
-    """
-    将 ``(B,C,H,W)`` 棋盘展平为 ``H*W`` 个 token，线性嵌入 + 可学习位置编码，
-    经 ``TransformerEncoder`` 后对各 token 表征做均值池化得到局面向量。
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        d_model: int,
-        num_layers: int,
-        nhead: int,
-        dim_feedforward: int,
-        board_h: int = 10,
-        board_w: int = 9,
-        dropout: float = 0.05,
-    ) -> None:
-        super().__init__()
-        if d_model % nhead != 0:
-            raise ValueError(f"d_model={d_model} 必须能被 nhead={nhead} 整除")
-        self.in_channels = in_channels
-        self.d_model = d_model
-        self.nhead = nhead
-        self.num_layers = num_layers
-        self.dim_feedforward = dim_feedforward
-        self.board_h = board_h
-        self.board_w = board_w
-        self.n_tokens = board_h * board_w
-        self.in_proj = nn.Linear(in_channels, d_model)
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_tokens, d_model))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.xavier_uniform_(self.in_proj.weight)
-        if self.in_proj.bias is not None:
-            nn.init.zeros_(self.in_proj.bias)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = build_transformer_encoder(enc_layer, num_layers)
-        self.out_norm = nn.LayerNorm(d_model)
-
-    def forward(self, x_nchw: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x_nchw.shape
-        if h * w != self.n_tokens or c != self.in_channels:
-            raise ValueError(
-                f"期望输入空间 {self.board_h}x{self.board_w}、通道 {self.in_channels}，"
-                f"收到 {h}x{w}、C={c}"
-            )
-        seq = x_nchw.flatten(2).transpose(1, 2)
-        z = self.in_proj(seq) + self.pos_embed
-        z = self.encoder(z)
-        z = self.out_norm(z)
-        return z.mean(dim=1)
-
-
 class SuccessorPolicy(nn.Module):
     """
     共享 trunk 读走棋前当前局面 ``(B,C,10,9)``：
     - ``head_src``：90 维，选起点格（ICCS 展平 ``y*9+x``）；
     - ``head_dst``：在 teacher/推理给定起点 one-hot 拼接后，90 维选落点格；
-    - ``value_head``：红方胜/和/负三分类。
+    - ``value_head``：红方胜/和/负三分类（与当前训练管线一致）。
 
-    ``backbone="transformer"``（默认）：棋盘通道展平为 token，线性嵌入 + ``TransformerEncoder``；
-    ``filters`` 为 ``d_model``。
-    ``backbone="resnet"``：3×3 卷积残差塔 + GAP（与旧 checkpoint 键名兼容）。
+    卷积塔与 ``StarlightChessOrg/MyElephant`` 提交 ``91e27b25`` 中 ``SuccessorPolicy`` 一致：
+    ``3×3 stem`` + ``num_res_layers`` 个 ``ResBlock`` + 全局平均池化；在此之上接两阶段策略头与价值头。
     """
 
     def __init__(
         self,
-        num_res_layers: int = 12,
+        num_res_layers: int = 10,
         in_channels: int | None = None,
-        filters: int = 576,
+        filters: int = 256,
         grid: int = POLICY_GRID_NUMEL,
-        backbone: str = "transformer",
-        nhead: int | None = None,
-        dim_feedforward: int | None = None,
-        transformer_dropout: float = 0.05,
     ) -> None:
         super().__init__()
         c = in_channels if in_channels is not None else POLICY_SELECT_IN_CHANNELS
         self.in_channels = c
         self.grid = grid
         self.filters = filters
-        bkb = backbone.lower().strip()
-        if bkb not in ("transformer", "resnet"):
-            raise ValueError(f"未知 backbone={backbone!r}，请用 transformer 或 resnet")
-        self.backbone_name = bkb
-
-        if bkb == "transformer":
-            nh = int(nhead) if nhead is not None else default_transformer_nhead(filters)
-            if filters % nh != 0:
-                raise ValueError(f"filters(=d_model)={filters} 必须能被 nhead={nh} 整除，可改 --nhead")
-            ff = int(dim_feedforward) if dim_feedforward is not None else max(128, 4 * filters)
-            self.xfm_trunk = TransformerBoardTrunk(
-                in_channels=c,
-                d_model=filters,
-                num_layers=num_res_layers,
-                nhead=nh,
-                dim_feedforward=ff,
-                dropout=transformer_dropout,
-            )
-        else:
-            self.xfm_trunk = None
-            self.stem_conv = nn.Conv2d(c, filters, 3, padding=1, bias=False)
-            self.stem_bn = nn.BatchNorm2d(filters)
-            self.blocks = nn.Sequential(*[ResBlock(filters) for _ in range(num_res_layers)])
-            self.pool = nn.AdaptiveAvgPool2d(1)
+        self.stem_conv = nn.Conv2d(c, filters, 3, padding=1, bias=False)
+        self.stem_bn = nn.BatchNorm2d(filters)
+        self.blocks = nn.Sequential(*[ResBlock(filters) for _ in range(num_res_layers)])
+        self.pool = nn.AdaptiveAvgPool2d(1)
 
         self.head_src = nn.Linear(filters, grid)
         self.head_dst = nn.Linear(filters + grid, grid)
         self.value_head = nn.Linear(filters, 3)
 
     def _trunk_flat(self, x_nchw: torch.Tensor) -> torch.Tensor:
-        if self.backbone_name == "transformer":
-            assert self.xfm_trunk is not None
-            return self.xfm_trunk(x_nchw)
-        assert self.stem_conv is not None and self.stem_bn is not None
-        assert self.blocks is not None and self.pool is not None
         t = F.elu(self.stem_bn(self.stem_conv(x_nchw)))
         t = self.blocks(t)
         return self.pool(t).flatten(1)

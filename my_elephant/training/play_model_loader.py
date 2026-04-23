@@ -10,20 +10,16 @@ from my_elephant.chess import FEATURE_LIST
 from my_elephant.chess.rationale import POLICY_SELECT_IN_CHANNELS
 from my_elephant.training.policy_torch import (
     SuccessorPolicy,
-    count_transformer_encoder_layers_in_state,
-    default_transformer_nhead,
+    count_resnet_blocks_in_state,
     torch_load_checkpoint,
 )
 
 
 def _infer_filters_from_state(sd: dict) -> int:
-    w = sd.get("xfm_trunk.in_proj.weight")
-    if w is not None:
-        return int(w.shape[0])
     w = sd.get("stem_conv.weight")
     if w is not None:
         return int(w.shape[0])
-    return 576
+    return 256
 
 
 def load_successor_policy_for_play(
@@ -36,39 +32,23 @@ def load_successor_policy_for_play(
     sd = ckpt["model"]
     if any(k.startswith("hybrid_trunk.") for k in sd) or str(ckpt.get("backbone", "")).lower() == "hybrid":
         raise ValueError(
-            "checkpoint 为已移除的 hybrid 主干，无法加载；请换用 transformer/resnet 权重或回退到仍含 hybrid 的仓库版本。"
+            "checkpoint 为已移除的 hybrid 主干，无法加载；请换用 ResNet 两阶段权重或回退到仍含 hybrid 的仓库版本。"
         )
-    backbone = str(ckpt.get("backbone", "")).lower()
-    if backbone not in ("transformer", "resnet"):
-        if any(k.startswith("xfm_trunk.") for k in sd):
-            backbone = "transformer"
-        else:
-            backbone = "resnet"
+    if any(k.startswith("xfm_trunk.") for k in sd) or str(ckpt.get("backbone", "")).lower() == "transformer":
+        raise ValueError(
+            "checkpoint 为 transformer 主干，本版本已改为仅 ResNet 塔；请换用 resnet 权重或使用旧分支。"
+        )
     filters = int(ckpt.get("filters", _infer_filters_from_state(sd)))
     num_res = int(ckpt.get("num_res_layers", 0))
-    if num_res <= 0 and backbone == "transformer":
-        num_res = count_transformer_encoder_layers_in_state(sd, "xfm_trunk.encoder.layers.") or 12
-    elif num_res <= 0:
-        num_res = 4
+    if num_res <= 0:
+        num_res = count_resnet_blocks_in_state(sd) or 10
     in_ch = int(
         ckpt.get("in_channels", ckpt.get("select_in_channels", in_channels or POLICY_SELECT_IN_CHANNELS))
     )
-    nhead = ckpt.get("nhead")
-    dim_ff = ckpt.get("dim_feedforward")
-    if backbone == "transformer":
-        if nhead is None:
-            nhead = default_transformer_nhead(filters)
-        else:
-            nhead = int(nhead)
-        if dim_ff is not None:
-            dim_ff = int(dim_ff)
     model = SuccessorPolicy(
         num_res_layers=num_res,
         in_channels=in_ch,
         filters=filters,
-        backbone=backbone,
-        nhead=int(nhead) if backbone == "transformer" and nhead is not None else nhead,
-        dim_feedforward=dim_ff,
     ).to(device)
     model.load_state_dict(sd, strict=False)
     model.eval()

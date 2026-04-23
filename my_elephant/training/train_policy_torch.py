@@ -1,6 +1,6 @@
 """
 使用 PyTorch 训练两阶段策略（起点格 + 落点格 CE）与红方胜/和/负价值头
-（``Head/RecordResult`` CE，与 ``cchess.reader_xqf`` 编码一致）。主干默认 **纯 Transformer**，可选 ResNet 兼容旧权重。
+（``Head/RecordResult`` CE，与 ``cchess.reader_xqf`` 编码一致）。主干为 **ResNet 卷积塔**（与 ``StarlightChessOrg/MyElephant`` 提交 ``91e27b25`` 中塔结构一致）+ 当前两阶段策略头与三分类价值头。
 
 依赖：pip install torch pandas（GPU 需对应 CUDA 版 torch）。
 """
@@ -27,7 +27,7 @@ from my_elephant.training.policy_torch import (
     SuccessorPolicy,
     accuracy_from_logits_masked,
     batched_current_nhwc_to_torch,
-    count_transformer_encoder_layers_in_state,
+    count_resnet_blocks_in_state,
     joint_move_accuracy,
     torch_load_checkpoint,
     value_accuracy_ignore,
@@ -79,50 +79,24 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--train-list", type=Path, default=Path("data/train_list.csv"))
     p.add_argument("--test-list", type=Path, default=Path("data/test_list.csv"))
-    p.add_argument("--model-name", type=str, default="policy_transformer_torch")
+    p.add_argument("--model-name", type=str, default="policy_resnet_torch")
     p.add_argument(
         "--batch-size",
         type=int,
-        default=32,
-        help="每步 batch；大模型默认略小，显存紧张时可再减",
+        default=64,
+        help="每步 batch；显存紧张时可减小",
     )
     p.add_argument(
         "--num-res-layers",
         type=int,
-        default=12,
-        help="主干深度：ResNet 时为残差块数；transformer 时为 TransformerEncoder 层数（默认与 ~180MB 级 checkpoint 配套）",
+        default=10,
+        help="ResNet 残差块数（与 commit 91e27b25 默认一致；``--resume`` 时可从权重推断）",
     )
     p.add_argument(
         "--filters",
         type=int,
-        default=576,
-        help="ResNet 时为卷积宽度；transformer 时为 d_model（旧 checkpoint 请与训练时一致）",
-    )
-    p.add_argument(
-        "--backbone",
-        type=str,
-        default="transformer",
-        choices=("transformer", "resnet"),
-        help="transformer=棋盘展平 token + Transformer（默认）；resnet=纯卷积残差塔（旧权重）",
-    )
-    p.add_argument(
-        "--nhead",
-        type=int,
-        default=None,
-        help="transformer 多头数（须整除 --filters）；默认自动选取",
-    )
-    p.add_argument(
-        "--dim-feedforward",
-        type=int,
-        default=None,
-        dest="dim_feedforward",
-        help="Transformer FFN 隐层宽度（默认 max(128, 4×filters)）",
-    )
-    p.add_argument(
-        "--transformer-dropout",
-        type=float,
-        default=0.05,
-        help="Transformer 内 dropout（eval 下为 0）",
+        default=256,
+        help="卷积宽度（stem 与各 ResBlock 通道；旧 checkpoint 请与训练时一致）",
     )
     p.add_argument("--gpu", type=int, default=0, help="GPU 编号；-1 表示 CPU")
     p.add_argument("--n-epochs", type=int, default=100)
@@ -224,30 +198,18 @@ def main() -> None:
             sd = {}
         if any(k.startswith("hybrid_trunk.") for k in sd) or str(ckpt.get("backbone", "")).lower() == "hybrid":
             raise ValueError(
-                "checkpoint 为已移除的 hybrid 主干，无法加载；请换用 transformer/resnet 权重或回退到仍含 hybrid 的仓库版本。"
+                "checkpoint 为已移除的 hybrid 主干，无法加载；请换用 ResNet 两阶段权重或回退到仍含 hybrid 的仓库版本。"
             )
-        if ckpt.get("backbone") is not None:
-            args.backbone = str(ckpt["backbone"])
-        elif any(k.startswith("xfm_trunk.") for k in sd):
-            args.backbone = "transformer"
-        elif "stem_conv.weight" in sd:
-            args.backbone = "resnet"
-        if ckpt.get("nhead") is not None:
-            args.nhead = int(ckpt["nhead"])
-        if ckpt.get("dim_feedforward") is not None:
-            args.dim_feedforward = int(ckpt["dim_feedforward"])
+        if any(k.startswith("xfm_trunk.") for k in sd) or str(ckpt.get("backbone", "")).lower() == "transformer":
+            raise ValueError(
+                "checkpoint 为 transformer 主干，本版本已改为仅 ResNet 塔（见 commit 91e27b25 塔结构 + 两阶段头）；请换用 resnet 权重或使用旧分支。"
+            )
         in_ch = (
             args.in_channels
             if args.in_channels is not None
             else int(ckpt.get("in_channels", ckpt.get("select_in_channels", POLICY_SELECT_IN_CHANNELS)))
         )
-        if isinstance(sd, dict) and "xfm_trunk.in_proj.weight" in sd:
-            inferred_f = int(sd["xfm_trunk.in_proj.weight"].shape[0])
-            if ckpt.get("filters") is not None:
-                args.filters = int(ckpt["filters"])
-            else:
-                args.filters = inferred_f
-        elif isinstance(sd, dict) and "stem_conv.weight" in sd:
+        if isinstance(sd, dict) and "stem_conv.weight" in sd:
             inferred_f = int(sd["stem_conv.weight"].shape[0])
             if ckpt.get("filters") is not None:
                 args.filters = int(ckpt["filters"])
@@ -255,8 +217,8 @@ def main() -> None:
                 args.filters = inferred_f
         if ckpt.get("num_res_layers") is not None:
             args.num_res_layers = int(ckpt["num_res_layers"])
-        elif isinstance(sd, dict) and args.backbone == "transformer":
-            nlay = count_transformer_encoder_layers_in_state(sd, "xfm_trunk.encoder.layers.")
+        elif isinstance(sd, dict):
+            nlay = count_resnet_blocks_in_state(sd)
             if nlay > 0:
                 args.num_res_layers = nlay
     else:
@@ -295,22 +257,11 @@ def main() -> None:
         num_res_layers=args.num_res_layers,
         in_channels=in_ch,
         filters=args.filters,
-        backbone=args.backbone,
-        nhead=args.nhead,
-        dim_feedforward=args.dim_feedforward,
-        transformer_dropout=args.transformer_dropout,
     ).to(device)
     nparam = sum(p.numel() for p in model.parameters())
-    if args.backbone == "transformer" and getattr(model, "xfm_trunk", None) is not None:
-        xf = model.xfm_trunk
-        print(
-            f"[model] backbone=transformer d_model={args.filters} layers={args.num_res_layers} "
-            f"nhead={xf.nhead} dim_ff={xf.dim_feedforward} params={nparam:,}"
-        )
-    else:
-        print(
-            f"[model] backbone=resnet filters={args.filters} res_blocks={args.num_res_layers} params={nparam:,}"
-        )
+    print(
+        f"[model] backbone=resnet filters={args.filters} res_blocks={args.num_res_layers} params={nparam:,}"
+    )
     optimizer = SGD(model.parameters(), lr=args.beginning_lr, momentum=0.9)
 
     epoch_begin = 0
@@ -517,13 +468,10 @@ def main() -> None:
             "num_res_layers": args.num_res_layers,
             "filters": model.filters,
             "in_channels": model.in_channels,
-            "backbone": args.backbone,
+            "backbone": "resnet",
             "val_loss": val_loss,
             "best_val_loss": best_val_loss,
         }
-        if args.backbone == "transformer" and getattr(model, "xfm_trunk", None) is not None:
-            payload["nhead"] = model.xfm_trunk.nhead
-            payload["dim_feedforward"] = model.xfm_trunk.dim_feedforward
         torch.save(payload, ckpt_dir / "last.pt")
         if improved:
             torch.save(payload, ckpt_dir / "best.pt")

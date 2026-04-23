@@ -2,7 +2,7 @@
 
 在 [Icy Elephant](https://github.com/bupticybee/icyElephant) 思路上整理的中国象棋 **PyTorch 策略 + 价值训练 / 图形对弈** 代码：
 
-- **策略头（与 UI 一致：先选子再选落点）**：仅用走棋前当前局面的 **7 路有符号兵种平面**（红 +1 / 黑 −1，固定红方棋盘视角）过共享编码主干（默认 **纯 Transformer**：通道展平为 **90** 个 token，线性嵌入 + ``TransformerEncoder``；亦可 ``--backbone resnet`` 兼容旧卷积权重）→ **起点格** 90 类（ICCS 展平 `y*9+x`）+ 在 teacher/推理给定起点 one-hot 后 **落点格** 90 类；训练时对起点、落点各做交叉熵（落点 mask 为「在棋谱真实起点下」的合法到达格）。
+- **策略头（与 UI 一致：先选子再选落点）**：仅用走棋前当前局面的 **7 路有符号兵种平面**（红 +1 / 黑 −1，固定红方棋盘视角）过共享编码主干（默认 **ResNet**：``3×3`` stem + 若干 **ResBlock** + 全局平均池化；卷积塔与上游仓库提交 [``91e27b25``](https://github.com/StarlightChessOrg/MyElephant/commit/91e27b25d1448bb844eb44821257958810a672ca) 中 ``SuccessorPolicy`` 塔结构一致）→ **起点格** 90 类（ICCS 展平 `y*9+x`）+ 在 teacher/推理给定起点 one-hot 后 **落点格** 90 类；训练时对起点、落点各做交叉熵（落点 mask 为「在棋谱真实起点下」的合法到达格）。
 - **价值头**：同一主干池化后输出红方 **胜 / 和 / 负** 三分类 logit，与棋谱 `Head/RecordResult` 对齐做交叉熵（无标签样本忽略）。
 - 走棋方不进平面编码；MCTS / 纯网络走子用分解式 `P(着)=P(起点)P(落点|起点)` 在合法着集合上归一化得到 prior。
 
@@ -57,21 +57,19 @@ python -m my_elephant.training.train_policy_torch --model-name my_run
 python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 ```
 
-### 默认模型规模（约 180MB 级 checkpoint）
+### 默认模型规模（ResNet 两阶段 + 价值头）
 
-- **主干默认 `transformer`**：`--filters` 即 **d_model**（默认 **576**），`--num-res-layers` 为 **TransformerEncoder** 层数（默认 **12**），`dim_feedforward` 未指定时为 **`max(128, 4×filters)`**，`--nhead` 未指定时按维度自动选取（须整除 `filters`）。**可训练参数约 4800 万**，**仅权重（`state_dict`，float32）约 183 MB**（与「约 180MB 级」参数规模一致）。训练保存的 `best.pt`/`last.pt` 另含 **SGD 动量缓冲**（在优化器至少执行过 `step()` 之后），**整文件常约 360MB+**；若需对外分发推理权重，可只导出 `state_dict` 或自行裁剪。
-- **`--backbone resnet`**：仅 **3×3 卷积 + 残差块** 塔 + GAP（与仅含顶层 `stem_conv` / `blocks` 的旧 checkpoint 一致）。
-- Checkpoint 保存 **`backbone`**、**`filters`**、**`num_res_layers`**；`transformer` 时另存 **`nhead`**、**`dim_feedforward`**。`--resume` 时按权重键名推断 **`xfm_trunk.*` / 顶层 `stem_conv`**（**已移除 hybrid**，含 `hybrid_trunk.*` 的旧权重将无法加载，需用旧版代码或改训 transformer）。
+- **主干**：`--filters` 为卷积宽度（默认 **256**），`--num-res-layers` 为 **ResBlock** 个数（默认 **10**，与上述 ``91e27b25`` 塔默认一致）。池化后接 **起点 / 落点** 两阶段线性头及 **红方胜/和/负** 三分类价值头（``value_head``）。
+- Checkpoint 保存 **`backbone`=`resnet`**、**`filters`**、**`num_res_layers`**。`--resume` 时可从 **`stem_conv`**、**`blocks.*`** 推断宽度与深度。**含 `xfm_trunk.*` 的 transformer 权重**、**含 `hybrid_trunk.*` 的 hybrid 权重**均无法在本版本加载。
 
 ### 常用参数
 
 | 参数 | 说明 |
 |------|------|
 | `--cbf-root` | 数据集根目录，自动搜 `.cbf` 并划分 train/val |
-| `--batch-size` | 每步 batch（默认 `32`，大模型可再减） |
-| `--backbone` | `transformer`（默认）或 `resnet` |
-| `--filters` / `--num-res-layers` | transformer 下分别为 **d_model** 与 **Encoder 层数**（默认 `576` / `12`） |
-| `--nhead` / `--dim-feedforward` / `--transformer-dropout` | transformer：注意力头数、FFN、dropout |
+| `--batch-size` | 每步 batch（默认 `64`） |
+| `--filters` | 卷积宽度（默认 `256`） |
+| `--num-res-layers` | ResBlock 个数（默认 `10`） |
 | `--num-workers` | `DataLoader` 子进程数；**默认** `min(8, CPU 核数)`，`0` 表示主进程加载 |
 | `--prefetch-factor` | 每 worker 预取 batch 数（`num_workers>0` 时） |
 | `--value-loss-weight` | 价值头 CE 相对策略损失（起点 CE + 落点 CE）的权重（默认 `0.5`） |
