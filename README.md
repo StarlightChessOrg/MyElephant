@@ -101,7 +101,9 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 
 ## 对弈（Tkinter）
 
-`play_policy_torch` 为 **图形界面**：圆形棋子、鼠标选子再走子；**箭头**标示上一手起点→终点；红/黑可分别选择 **人类**、**纯网络**、**MCTS+策略价值网络**。MCTS 在后台线程运行，避免卡 UI。**推理固定走 CPU**（小权重避免 GPU 往返）。MCTS 使用**常驻线程池**（`--mcts-workers`，退出时关闭）。可选 **`--mcts-http-workers N`**：再启动 **N 个本机 HTTP 子进程**（`127.0.0.1`，端口自 `--mcts-http-base-port` 起递增），父进程经 **POST `/eval`** 把局面 FEN 发给子进程做前向，以利用多核；退出时先停线程池再结束子进程。子进程入口：`python -m my_elephant.training.policy_eval_worker`。
+`play_policy_torch` 为 **图形界面**：圆形棋子、鼠标选子再走子；**箭头**标示上一手起点→终点；红/黑可分别选择 **人类**、**纯网络**、**MCTS+策略价值网络**。MCTS 在后台线程运行，避免卡 UI。**推理固定走 CPU**（小权重避免 GPU 往返）。MCTS 使用**常驻线程池**（`--mcts-workers`，退出时关闭）。对弈 MCTS 在**下一着思考**时若上一步已保留搜索树，会沿实盘着法链**下降复用子树**（FEN 校验），延续 ``N``/``W``/``P`` 统计。新局、纯网络着法、错误或子树路径缺失时丢弃缓存。
+
+可选 **`--mcts-http-workers N`**：再启动 **N 个本机 HTTP 子进程**（`127.0.0.1`，端口自 `--mcts-http-base-port` 起递增），父进程经 **POST `/eval`** 把局面 FEN 发给子进程做前向，以利用多核；退出时先停线程池再结束子进程。子进程入口：`python -m my_elephant.training.policy_eval_worker`。
 
 ```bash
 python -m my_elephant.training.play_policy_torch --checkpoint models/my_run/best.pt

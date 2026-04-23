@@ -31,6 +31,43 @@ def copy_gameplay(g: GamePlay) -> GamePlay:
     return o
 
 
+def _fen_of_gp(gp: GamePlay) -> str:
+    return gp.bb.to_fen()
+
+
+def descend_mcts_subtree(
+    prev_root: _MCTSNode | None,
+    moves: list[str],
+    current_gp: GamePlay,
+) -> _MCTSNode | None:
+    """
+    从上次 MCTS 的根 ``prev_root`` 沿实着序列 ``moves`` 下降；若末端局面与 ``current_gp`` 的 FEN 一致则返回该节点供复用，否则 ``None``。
+    ``moves`` 为 ICCS 串如 ``"7170-7171"``，与树上 ``children`` 键一致。
+    """
+    if prev_root is None:
+        return None
+    want = _fen_of_gp(copy_gameplay(current_gp))
+    n = prev_root
+    for m in moves:
+        if m not in n.children:
+            return None
+        n = n.children[m]
+    if _fen_of_gp(n.gp) != want:
+        return None
+    return n
+
+
+def _reuse_mcts_root_or_fresh(root_gp: GamePlay, reuse: _MCTSNode | None) -> _MCTSNode:
+    """若 ``reuse`` 与 ``root_gp`` 局面一致则复用（脱挂 parent），否则新建根。"""
+    target = copy_gameplay(root_gp)
+    if reuse is not None and _fen_of_gp(reuse.gp) == _fen_of_gp(target):
+        r = reuse
+        r.parent = None
+        r.move_from_parent = None
+        return r
+    return _MCTSNode(target)
+
+
 def _terminal_outcome(gp: GamePlay) -> float | None:
     """若无合法着：将死则轮到方 -1，否则和 0；有合法着返回 None。"""
     if gp.legal_moves_iccs():
@@ -224,15 +261,14 @@ def _single_playout(
 
 
 def _mcts_search_sequential(
-    root_gp: GamePlay,
+    root: _MCTSNode,
     evaluator: Callable[[GamePlay], tuple[list[str], np.ndarray, float]],
     n_simulations: int,
     c_puct: float,
     max_seconds: float | None,
     t0: float,
-) -> tuple[_MCTSNode, int, int, str]:
-    """单线程原版循环；返回 (root, n_playouts, n_expansions, stopped_by)。"""
-    root = _MCTSNode(copy_gameplay(root_gp))
+) -> tuple[int, int, str]:
+    """单线程原版循环；``root`` 已就绪。返回 (n_playouts, n_expansions, stopped_by)。"""
     if _terminal_outcome(root.gp) is not None:
         raise RuntimeError("根节点已终局")
 
@@ -261,7 +297,7 @@ def _mcts_search_sequential(
             path.append((node, a))
             node = node.children[a]
 
-    return root, n_playouts, n_expansions, stopped_by
+    return n_playouts, n_expansions, stopped_by
 
 
 def mcts_search(
@@ -274,9 +310,12 @@ def mcts_search(
     virtual_loss: float = 3.0,
     n_workers: int | None = None,
     thread_pool: ThreadPoolExecutor | None = None,
-) -> tuple[str, MCTSSearchStats]:
+    reuse_subtree: _MCTSNode | None = None,
+) -> tuple[str, MCTSSearchStats, _MCTSNode]:
     """
-    从 ``root_gp`` 当前局面出发做 MCTS，返回 ``(走法, 统计)``。
+    从 ``root_gp`` 当前局面出发做 MCTS，返回 ``(走法, 统计, 本次搜索的根节点)``。
+
+    ``reuse_subtree``：若由 ``descend_mcts_subtree`` 得到且局面与 ``root_gp`` 一致，则在该子树上继续搜索（保留 ``P``/``N``/``W`` 等统计）。
 
     ``max_seconds``：每条模拟开始前检查；``None`` 表示不限时。
 
@@ -286,7 +325,8 @@ def mcts_search(
     ``thread_pool``：若传入已创建的 ``ThreadPoolExecutor``，则复用其工作线程且**不在此函数内关闭**池子；
     为 ``None`` 时每次搜索临时创建并销毁线程池。
     """
-    if _terminal_outcome(copy_gameplay(root_gp)) is not None:
+    root = _reuse_mcts_root_or_fresh(root_gp, reuse_subtree)
+    if _terminal_outcome(root.gp) is not None:
         raise RuntimeError("根节点已终局")
 
     t0 = time.perf_counter()
@@ -297,12 +337,11 @@ def mcts_search(
         nw = max(1, min(nw, int(pool_cap)))
 
     if nw <= 1:
-        root, n_playouts, n_expansions, stopped_by = _mcts_search_sequential(
-            root_gp, evaluator, n_simulations, c_puct, max_seconds, t0
+        n_playouts, n_expansions, stopped_by = _mcts_search_sequential(
+            root, evaluator, n_simulations, c_puct, max_seconds, t0
         )
         vl_report = 0.0
     else:
-        root = _MCTSNode(copy_gameplay(root_gp))
         lock = threading.RLock()
         counters = {"n_completed": 0, "n_expansions": 0}
         vl_report = float(virtual_loss)
@@ -361,4 +400,4 @@ def mcts_search(
         parallel_workers=nw,
         virtual_loss=vl_report,
     )
-    return best, stats
+    return best, stats, root

@@ -21,7 +21,12 @@ import torch
 from my_elephant.chess import GamePlay
 from my_elephant.chess.features import parse_move_squares
 
-from my_elephant.training.mcts_engine import MCTSSearchStats, copy_gameplay, mcts_search
+from my_elephant.training.mcts_engine import (
+    MCTSSearchStats,
+    copy_gameplay,
+    descend_mcts_subtree,
+    mcts_search,
+)
 from my_elephant.training.play_model_loader import load_successor_policy_for_play
 from my_elephant.training.policy_eval_http import (
     PolicyHTTPEvalClient,
@@ -118,6 +123,9 @@ class XiangqiTkApp:
         self.last_move: tuple[int, int, int, int] | None = None
         self._ai_busy = False
         self._last_mcts_info: str | None = None
+        # 子树复用：上次 MCTS 的根与自那以后在实盘上走过的 ICCS 着法链
+        self._mcts_prev_tree_root: object | None = None
+        self._mcts_moves_since_search: list[str] = []
 
         nw_cap = mcts_workers if mcts_workers is not None else (os.cpu_count() or 1)
         nw_cap = max(1, min(64, nw_cap))
@@ -176,6 +184,10 @@ class XiangqiTkApp:
         self._refresh_board()
 
         master.protocol("WM_DELETE_WINDOW", self._on_close_window)
+
+    def _invalidate_mcts_subtree_cache(self) -> None:
+        self._mcts_prev_tree_root = None
+        self._mcts_moves_since_search.clear()
 
     def _shutdown_mcts_http_workers(self) -> None:
         """终止多进程 HTTP 评估子进程（可重复调用）。"""
@@ -337,6 +349,8 @@ class XiangqiTkApp:
         return {f"{a}{b}-{c}{d}" for (a, b, c, d) in self.game.legal_moves_iccs()}
 
     def _apply_move(self, mv: str) -> None:
+        if self._mcts_prev_tree_root is not None:
+            self._mcts_moves_since_search.append(mv)
         x1, y1, x2, y2 = parse_move_squares(mv)
         self.last_move = (x1, y1, x2, y2)
         self.game.make_move(mv)
@@ -402,8 +416,16 @@ class XiangqiTkApp:
         self._ai_busy = True
         self.status.config(text="AI 思考中…")
 
+        if s == STRATEGY_MCTS:
+            moves_chain = list(self._mcts_moves_since_search)
+            self._mcts_moves_since_search.clear()
+            reuse_sub = descend_mcts_subtree(self._mcts_prev_tree_root, moves_chain, self.game)
+        else:
+            reuse_sub = None
+
         def worker() -> None:
             mcts_st: MCTSSearchStats | None = None
+            root_out: object | None = None
             try:
                 g = copy_gameplay(self.game)
                 if s == STRATEGY_NEURAL:
@@ -426,7 +448,7 @@ class XiangqiTkApp:
                         def ev(gp: GamePlay):
                             return eval_policy_value_at_root(gp, self.model, self.device, self.flist)
 
-                    mv, mcts_st = mcts_search(
+                    mv, mcts_st, root_out = mcts_search(
                         g,
                         ev,
                         n_simulations=self.mcts_sims,
@@ -435,26 +457,35 @@ class XiangqiTkApp:
                         virtual_loss=self.mcts_virtual_loss,
                         n_workers=self.mcts_workers,
                         thread_pool=self._mcts_executor,
+                        reuse_subtree=reuse_sub,
                     )
             except Exception as e:
                 err = str(e)
                 self.master.after(0, lambda err=err: self._ai_done_error(err))
                 return
             if mcts_st is not None:
-                self.master.after(0, lambda m=mv, st=mcts_st: self._ai_done_move(m, st))
+                self.master.after(0, lambda m=mv, st=mcts_st, r=root_out: self._ai_done_move(m, st, r))
             else:
-                self.master.after(0, lambda m=mv: self._ai_done_move(m))
+                self.master.after(0, lambda m=mv: self._ai_done_move(m, None, None))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _ai_done_error(self, msg: str) -> None:
         self._ai_busy = False
+        self._invalidate_mcts_subtree_cache()
         self.status.config(text="")
         messagebox.showerror("AI 错误", msg)
         self._refresh_board()
 
-    def _ai_done_move(self, mv: str, mcts_st: MCTSSearchStats | None = None) -> None:
+    def _ai_done_move(
+        self,
+        mv: str,
+        mcts_st: MCTSSearchStats | None = None,
+        mcts_tree_root: object | None = None,
+    ) -> None:
         self._ai_busy = False
+        if mcts_st is None:
+            self._invalidate_mcts_subtree_cache()
         if mcts_st is not None:
             tlim = (
                 f"{mcts_st.requested_max_seconds:.2f}s"
@@ -469,9 +500,12 @@ class XiangqiTkApp:
                 f"并行{mcts_st.parallel_workers}线程 VL={mcts_st.virtual_loss:g}"
             )
         if mv not in self._legal_strings():
+            self._invalidate_mcts_subtree_cache()
             self._refresh_board()
             messagebox.showerror("AI", f"非法着法: {mv}")
             return
+        if mcts_st is not None and mcts_tree_root is not None:
+            self._mcts_prev_tree_root = mcts_tree_root
         self._apply_move(mv)
 
     def _new_game(self) -> None:
@@ -481,6 +515,7 @@ class XiangqiTkApp:
         self.sel_from = None
         self.last_move = None
         self._last_mcts_info = None
+        self._invalidate_mcts_subtree_cache()
         self._refresh_board()
         self._maybe_schedule_ai()
 
