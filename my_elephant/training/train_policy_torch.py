@@ -514,17 +514,14 @@ def main() -> None:
                 pb.complete(args.batch_size)
         val_acc_v = (val_v_correct / val_v_total) if val_v_total else float("nan")
         val_loss_v = float(np.average(losses_v)) if losses_v else float("nan")
+        acc_j_pct = 100.0 * float(np.average(accs))
+        acc_v_pct = (100.0 * val_acc_v) if val_v_total else float("nan")
         print(
-            "TEST ACC(joint move)%",
-            100.0 * np.average(accs),
-            "ACC(red-out)%",
-            (100.0 * val_acc_v) if val_v_total else float("nan"),
-            "LOSS total",
-            np.average(losses),
-            "LOSS pol",
-            np.average(losses_p),
-            "LOSS val",
-            val_loss_v,
+            f"TEST ACC(joint)={acc_j_pct:.2f}% "
+            f"ACC(red-out)={acc_v_pct:.2f}% "
+            f"LOSS total={float(np.average(losses)):.4f} "
+            f"pol={float(np.average(losses_p)):.4f} "
+            f"val={val_loss_v:.4f}"
         )
         writer.add_scalar("val/loss_total", float(np.average(losses)), epoch)
         writer.add_scalar("val/loss_policy", float(np.average(losses_p)), epoch)

@@ -15,6 +15,16 @@ from my_elephant.chess.rationale import POLICY_GRID_NUMEL, POLICY_SELECT_IN_CHAN
 from my_elephant.chess.session import GamePlay
 
 
+def build_transformer_encoder(
+    enc_layer: nn.TransformerEncoderLayer, num_layers: int
+) -> nn.TransformerEncoder:
+    """``norm_first=True`` 时 PyTorch 会放弃 nested tensor 并告警；显式关闭以消除该 UserWarning。"""
+    try:
+        return nn.TransformerEncoder(enc_layer, num_layers, enable_nested_tensor=False)
+    except TypeError:
+        return nn.TransformerEncoder(enc_layer, num_layers)
+
+
 def default_transformer_nhead(d_model: int) -> int:
     """取能整除 ``d_model`` 且单头维度不过小的注意力头数。"""
     for h in (8, 6, 4, 2):
@@ -115,7 +125,7 @@ class TransformerBoardTrunk(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+        self.encoder = build_transformer_encoder(enc_layer, num_layers)
         self.out_norm = nn.LayerNorm(d_model)
 
     def forward(self, x_nchw: torch.Tensor) -> torch.Tensor:
@@ -178,7 +188,7 @@ class HybridBoardTrunk(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_transformer_layers)
+        self.encoder = build_transformer_encoder(enc_layer, num_transformer_layers)
         self.out_norm = nn.LayerNorm(filters)
 
     def forward(self, x_nchw: torch.Tensor) -> torch.Tensor:
