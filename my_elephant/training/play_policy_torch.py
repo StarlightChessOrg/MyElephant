@@ -33,6 +33,8 @@ STRATEGY_HUMAN = "人类"
 STRATEGY_NEURAL = "纯网络"
 STRATEGY_MCTS = "MCTS+策略价值网络"
 STRATEGIES = (STRATEGY_HUMAN, STRATEGY_NEURAL, STRATEGY_MCTS)
+# ttk.Combobox 的 width 为字符宽度；略大于最长项以免「MCTS+策略价值网络」被裁切。
+_STRATEGY_COMBO_WIDTH = max(22, max(len(s) for s in STRATEGIES) + 6)
 
 # 棋子显示（红大写 / 黑小写 → 同一汉字，靠颜色区分）
 _PIECE_CHAR = {
@@ -134,18 +136,22 @@ class XiangqiTkApp:
 
         ttk.Label(right, text="红方策略").pack(anchor=tk.W)
         self.var_red = tk.StringVar(value=STRATEGY_HUMAN)
-        cb_r = ttk.Combobox(right, textvariable=self.var_red, values=STRATEGIES, state="readonly", width=14)
+        cb_r = ttk.Combobox(
+            right, textvariable=self.var_red, values=STRATEGIES, state="readonly", width=_STRATEGY_COMBO_WIDTH
+        )
         cb_r.pack(anchor=tk.W, pady=(0, 8))
         cb_r.bind("<<ComboboxSelected>>", lambda _e: master.after(50, self._maybe_schedule_ai))
 
         ttk.Label(right, text="黑方策略").pack(anchor=tk.W)
         self.var_black = tk.StringVar(value=STRATEGY_NEURAL)
-        cb_b = ttk.Combobox(right, textvariable=self.var_black, values=STRATEGIES, state="readonly", width=14)
+        cb_b = ttk.Combobox(
+            right, textvariable=self.var_black, values=STRATEGIES, state="readonly", width=_STRATEGY_COMBO_WIDTH
+        )
         cb_b.pack(anchor=tk.W, pady=(0, 8))
         cb_b.bind("<<ComboboxSelected>>", lambda _e: master.after(50, self._maybe_schedule_ai))
 
         ttk.Button(right, text="新局", command=self._new_game).pack(fill=tk.X, pady=4)
-        self.status = ttk.Label(right, text="", wraplength=200)
+        self.status = ttk.Label(right, text="", wraplength=280)
         self.status.pack(anchor=tk.W, pady=8)
 
         self._draw_static_grid()
@@ -429,7 +435,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--gpu", type=int, default=0, help="-1 为 CPU")
     p.add_argument("--in-channels", type=int, default=None)
-    p.add_argument("--mcts-sims", type=int, default=320, help="MCTS 模拟次数上限")
+    p.add_argument(
+        "--mcts-sims",
+        type=int,
+        default=192,
+        help="MCTS 模拟次数上限（默认较保守以缩短墙钟；要强棋可加大或配合 --mcts-max-seconds）",
+    )
     p.add_argument(
         "--mcts-max-seconds",
         type=float,

@@ -466,11 +466,15 @@ def eval_policy_value_at_root(
             seen.add((x1, y1))
             origins.append((x1, y1))
     origins.sort()
+    k = len(origins)
+    oh_batch = torch.zeros(k, POLICY_GRID_NUMEL, device=device, dtype=feat.dtype)
+    for idx, (ox, oy) in enumerate(origins):
+        oh_batch[idx, oy * 9 + ox] = 1.0
+    feat_rep = feat.expand(k, -1)
+    ld_batch = model.head_dst(torch.cat([feat_rep, oh_batch], dim=1))
     p_dst_given: dict[tuple[int, int], torch.Tensor] = {}
-    for ox, oy in origins:
-        oh = torch.zeros(1, POLICY_GRID_NUMEL, device=device, dtype=feat.dtype)
-        oh[0, oy * 9 + ox] = 1.0
-        ld = model.head_dst(torch.cat([feat, oh], dim=1))[0]
+    for idx, (ox, oy) in enumerate(origins):
+        ld = ld_batch[idx]
         dm = torch.zeros(POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
         for x1, y1, x2, y2 in legals_t:
             if (x1, y1) == (ox, oy):
