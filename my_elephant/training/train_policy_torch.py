@@ -118,7 +118,13 @@ def _parse_args() -> argparse.Namespace:
         "--resume",
         type=Path,
         default=None,
-        help="从 checkpoint 恢复（如 models/<name>/last.pt 或 best.pt）",
+        help="从指定 checkpoint 恢复（权重、优化器、epoch、global_step、best_val_loss）",
+    )
+    p.add_argument(
+        "--continue",
+        action="store_true",
+        dest="continue_train",
+        help="续训：自动加载 models/<--model-name>/last.pt（存在则恢复，不存在则从头训；若同时给 --resume 则只用 --resume）",
     )
     p.add_argument(
         "--in-channels",
@@ -153,6 +159,21 @@ def _device(args: argparse.Namespace) -> torch.device:
     return torch.device(f"cuda:{args.gpu}")
 
 
+def _resolve_resume_path(args: argparse.Namespace) -> Path | None:
+    """``--resume`` 优先；否则 ``--continue`` 时尝试 ``model_dir/model_name/last.pt``。"""
+    if args.resume is not None:
+        if getattr(args, "continue_train", False):
+            print("[续训] 已指定 --resume，忽略 --continue")
+        return args.resume
+    if getattr(args, "continue_train", False):
+        last_pt = args.model_dir / args.model_name / "last.pt"
+        if last_pt.is_file():
+            print(f"[续训] 自动加载 {last_pt.resolve()}")
+            return last_pt
+        print(f"[续训] 未找到 {last_pt.resolve()}，将从头训练")
+    return None
+
+
 def main() -> None:
     args = _parse_args()
     if args.num_workers is None:
@@ -162,10 +183,13 @@ def main() -> None:
     ckpt_dir = args.model_dir / args.model_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    resume_path = _resolve_resume_path(args)
+    if resume_path is not None and not resume_path.is_file():
+        raise FileNotFoundError(f"checkpoint 不存在: {resume_path.resolve()}")
     # 先在 CPU 上读权重，再在构建 DataLoader（多进程 fork/spawn）之后再 .to(cuda)，减轻 fork 后 CUDA 上下文问题
     ckpt = (
-        torch_load_checkpoint(args.resume, torch.device("cpu"))
-        if args.resume is not None
+        torch_load_checkpoint(resume_path, torch.device("cpu"))
+        if resume_path is not None
         else None
     )
     if ckpt is not None:

@@ -51,6 +51,12 @@ cd /path/to/MyElephant
 python -m my_elephant.training.train_policy_torch --model-name my_run
 ```
 
+**续训**：与上次相同的 `--model-name`（及 `--model-dir` 若改过）时，加 **`--continue`** 即可自动从 **`models/<model-name>/last.pt`** 恢复权重、优化器、epoch、`global_step`、`best_val_loss`；若该文件不存在会提示并从头训练。仍可用 **`--resume path/to.pt`** 指定任意 checkpoint；**同时写 `--resume` 与 `--continue` 时只认 `--resume`**。
+
+```bash
+python -m my_elephant.training.train_policy_torch --model-name my_run --continue
+```
+
 ### 默认模型规模（便于 MCTS 多次前向）
 
 - **`--num-res-layers`** 默认 **4**，**`--filters`** 默认 **64**（权重约数 MB 量级；旧 checkpoint 请与训练时一致或从 ckpt 自动推断）。
@@ -65,7 +71,8 @@ python -m my_elephant.training.train_policy_torch --model-name my_run
 | `--num-workers` | `DataLoader` 子进程数；**默认** `min(8, CPU 核数)`，`0` 表示主进程加载 |
 | `--prefetch-factor` | 每 worker 预取 batch 数（`num_workers>0` 时） |
 | `--value-loss-weight` | 价值头 CE 相对策略 CE 的权重（默认 `0.5`） |
-| `--resume` | 恢复训练；权重在 **CPU** 上加载后再 `model.to(device)`，减轻多进程与 CUDA 初始化顺序问题 |
+| `--continue` | 续训：自动加载 `models/<model-name>/last.pt`（见上文） |
+| `--resume` | 从指定 `.pt` 恢复；权重在 **CPU** 上加载后再 `model.to(device)`；与 `--continue` 同时存在时优先本项 |
 
 数据管线使用 **`torch.utils.data.DataLoader` + `IterableDataset`**：多 worker 按文件列表分片并行读盘与解析；`worker_init_fn` 限制各进程 BLAS 线程数；CUDA 时可传 **`pin_memory_device`**；训练集默认 **`drop_last=True`**。
 
