@@ -1,4 +1,4 @@
-"""棋谱样本：`IterableDataset` + `DataLoader` 多进程并行解析与预取 (后继平面, mask, 着法下标)。"""
+"""棋谱样本：`IterableDataset` + `DataLoader` 多进程并行解析与预取（两阶段：起点格 + 落点格 + 价值标签）。"""
 from __future__ import annotations
 
 import math
@@ -14,7 +14,6 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from my_elephant.chess import FEATURE_LIST, convert_game
-from my_elephant.chess.rationale import POLICY_MAX_LEGAL_MOVES
 
 PolicySources = str | Path | list[str]
 
@@ -57,29 +56,6 @@ def split_paths_train_test(
     return shuffled[:gap], shuffled[gap:]
 
 
-def _pad_one_sample(
-    planes_kchw: np.ndarray,
-    k_valid: int,
-    label_idx: int,
-    k_max: int,
-    red_to_move: bool,
-    current_chw: np.ndarray,
-    outcome_cls: int,
-) -> tuple[np.ndarray, np.ndarray, np.int64, bool, np.ndarray, np.int64]:
-    if k_valid > k_max:
-        raise ValueError(
-            f"合法着法数 {k_valid} 超过 POLICY_MAX_LEGAL_MOVES={k_max}，请在 rationale 中调大 POLICY_MAX_LEGAL_MOVES"
-        )
-    c = int(planes_kchw.shape[1])
-    pad = np.zeros((k_max, c, 10, 9), dtype=np.float32)
-    pad[:k_valid] = planes_kchw
-    mask = np.zeros((k_max,), dtype=np.bool_)
-    mask[:k_valid] = True
-    x_hwc = np.transpose(pad, (0, 2, 3, 1))
-    cur_hwc = np.transpose(current_chw, (1, 2, 0))
-    return x_hwc, mask, np.int64(label_idx), red_to_move, cur_hwc, np.int64(outcome_cls)
-
-
 def _policy_dataloader_worker_init(_worker_id: int) -> None:
     """子进程内限制 BLAS/OpenMP 线程数，避免多 worker 与主训练线程抢核导致变慢。"""
     os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -92,16 +68,17 @@ def _policy_dataloader_worker_init(_worker_id: int) -> None:
         pass
 
 
-def collate_successor_policy_value_batch(
-    batch: list[tuple[np.ndarray, np.ndarray, np.int64, bool, np.ndarray, np.int64]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    xs = np.stack([b[0] for b in batch], axis=0)
-    ms = np.stack([b[1] for b in batch], axis=0)
-    ys = np.stack([np.int64(b[2]) for b in batch], axis=0)
-    red = np.asarray([bool(b[3]) for b in batch], dtype=np.bool_)
-    cur = np.stack([b[4] for b in batch], axis=0)
-    yv = np.stack([np.int64(b[5]) for b in batch], axis=0)
-    return xs, ms, ys, red, cur, yv
+def collate_twohead_policy_value_batch(
+    batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.int64, np.int64, bool, int]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    cur = np.stack([b[0] for b in batch], axis=0)
+    msrc = np.stack([b[1] for b in batch], axis=0)
+    mdst = np.stack([b[2] for b in batch], axis=0)
+    ys = np.stack([np.int64(b[3]) for b in batch], axis=0)
+    yd = np.stack([np.int64(b[4]) for b in batch], axis=0)
+    red = np.asarray([bool(b[5]) for b in batch], dtype=np.bool_)
+    yv = np.stack([np.int64(b[6]) for b in batch], axis=0)
+    return cur, msrc, mdst, ys, yd, red, yv
 
 
 def _shard_filelist_for_worker(filelist: list[str]) -> list[str]:
@@ -117,17 +94,14 @@ def _shard_filelist_for_worker(filelist: list[str]) -> list[str]:
     end = min(start + per, n)
     if start < end:
         return paths[start:end]
-    # 文件数少于 worker 数时，按 id 间隔取，避免空 shard
     sub = [paths[i] for i in range(wi.id, n, wi.num_workers)]
     return sub if sub else paths
 
 
 class SuccessorPolicyIterableDataset(IterableDataset):
     """
-    无限遍历：各 worker 只处理自己分片内的棋谱路径，打乱后循环；
-    每条棋谱用 `convert_game` 逐步 yield，经填充后作为单样本供 DataLoader 组 batch。
-
-    ``sources`` 可为单列无表头 CSV 路径，或已解析好的棋谱路径列表。
+    无限遍历：各 worker 分片棋谱路径；``convert_game`` 每步 yield
+    当前局面 HWC、起点/落点 mask 与标签，供两阶段策略 + 价值头训练。
     """
 
     def __init__(self, sources: PolicySources) -> None:
@@ -144,7 +118,6 @@ class SuccessorPolicyIterableDataset(IterableDataset):
             "red": list(FEATURE_LIST["red"]),
             "black": list(FEATURE_LIST["black"]),
         }
-        self.k_max = POLICY_MAX_LEGAL_MOVES
 
     def __iter__(self) -> Any:
         my_files = _shard_filelist_for_worker(self.filelist)
@@ -153,23 +126,8 @@ class SuccessorPolicyIterableDataset(IterableDataset):
             rnd.shuffle(my_files)
             for path in my_files:
                 try:
-                    for (
-                        planes_kchw,
-                        k_valid,
-                        label_idx,
-                        red_to_move,
-                        current_chw,
-                        outcome_cls,
-                    ) in convert_game(path, feature_list=self.feature_list):
-                        yield _pad_one_sample(
-                            planes_kchw,
-                            k_valid,
-                            label_idx,
-                            self.k_max,
-                            red_to_move,
-                            current_chw,
-                            outcome_cls,
-                        )
+                    for sample in convert_game(path, feature_list=self.feature_list):
+                        yield sample
                 except Exception:
                     continue
 
@@ -184,21 +142,12 @@ def make_policy_dataloader(
     drop_last: bool = False,
     pin_memory_device: str | None = None,
 ) -> DataLoader:
-    """
-    使用 ``torch.utils.data.DataLoader`` 包装 ``IterableDataset``：
-
-    - ``num_workers>0``：多进程并行读盘、解析 XML、枚举合法着法；各 worker 按文件列表分片，
-      主进程异步 ``collate`` 组 batch，并通过 ``prefetch_factor`` 预取多个 batch。
-    - ``pin_memory=True``（CUDA）时建议配合训练端 ``non_blocking=True`` 拷贝；
-      若 PyTorch≥2.0 可传 ``pin_memory_device``（如 ``\"cuda:0\"``）进一步加速锁页内存路径。
-    - ``drop_last=True`` 时丢弃最后一个不满 ``batch_size`` 的 batch，利于稳定步时。
-    """
     ds = SuccessorPolicyIterableDataset(sources)
     kw: dict[str, Any] = {
         "dataset": ds,
         "batch_size": batch_size,
         "num_workers": num_workers,
-        "collate_fn": collate_successor_policy_value_batch,
+        "collate_fn": collate_twohead_policy_value_batch,
         "pin_memory": pin_memory,
         "drop_last": drop_last,
     }
@@ -228,10 +177,6 @@ def build_policy_train_val_loaders(
     train_drop_last: bool = True,
     val_drop_last: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
-    """
-    构造训练 / 验证两个 ``DataLoader``，参数与 ``make_policy_dataloader`` 一致，
-    便于训练脚本集中配置并行与预取；默认训练 ``drop_last=True`` 以保持每步 batch 形状一致。
-    """
     train_loader = make_policy_dataloader(
         train_sources,
         batch_size=batch_size,
@@ -254,7 +199,6 @@ def build_policy_train_val_loaders(
 
 
 def default_num_workers(cap: int = 8) -> int:
-    """DataLoader 并行 worker 数的合理默认：不超过 ``cap``，且至少为 0。"""
     try:
         n = os.cpu_count() or 2
     except NotImplementedError:

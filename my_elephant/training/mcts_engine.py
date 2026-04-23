@@ -1,4 +1,4 @@
-"""PUCT 式 MCTS，配合双头网络（策略 prior + 标量价值）选着。"""
+"""PUCT 式 MCTS，配合策略（起点/落点）+ 价值网络选着。"""
 
 from __future__ import annotations
 

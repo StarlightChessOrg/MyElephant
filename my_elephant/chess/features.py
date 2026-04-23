@@ -83,7 +83,7 @@ def encode_model_planes(
 ) -> np.ndarray:
     """
     策略网络输入：**仅 7 路有符号兵种平面**（红 +1 / 黑 -1），**固定红方视角**的盘面矩阵，不按行棋方翻转。
-    走棋方信息不进入网络；训练/对弈时在损失与选着上用 ``policy_torch.logits_as_red_preference`` 把 raw logit 转成「对红方偏好」（红 argmax、黑等价于 raw argmin）。
+    走棋方信息不进入网络；策略为「先 ICCS 起点格、再落点格」两阶段分类（与对弈点击顺序一致）；价值头仍用红方视角三分类。
 
     ``red_to_move`` / ``board_state`` / ``feature_list`` 保留以兼容调用方，当前不参与本函数编码。
     """

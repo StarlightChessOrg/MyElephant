@@ -38,6 +38,8 @@ RATIONALE_PLANE_COUNT = 11
 POLICY_SELECT_IN_CHANNELS = 7
 # 训练批填充：合法着法数上界（一般远小于此；若棋谱超出需调大）
 POLICY_MAX_LEGAL_MOVES = 96
+# 策略「先起点后落点」：ICCS 9×10 展平为 90 格（下标 y*9+x）
+POLICY_GRID_NUMEL = 90
 # 棋局结果头：红方视角三分类（交叉熵类下标）；无标签时训练用 ignore_index
 RED_OUTCOME_WIN = 0
 RED_OUTCOME_DRAW = 1

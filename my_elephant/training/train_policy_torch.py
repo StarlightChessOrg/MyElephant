@@ -22,13 +22,12 @@ from my_elephant.training.policy_data import (
     discover_cbf_files,
     split_paths_train_test,
 )
-from my_elephant.chess.rationale import POLICY_SELECT_IN_CHANNELS, VALUE_LABEL_IGNORE
+from my_elephant.chess.rationale import POLICY_GRID_NUMEL, POLICY_SELECT_IN_CHANNELS, VALUE_LABEL_IGNORE
 from my_elephant.training.policy_torch import (
     SuccessorPolicy,
     accuracy_from_logits_masked,
     batched_current_nhwc_to_torch,
-    batched_successors_nhwc_to_torch,
-    logits_as_red_preference,
+    joint_move_accuracy,
     torch_load_checkpoint,
     value_accuracy_ignore,
 )
@@ -290,35 +289,38 @@ def main() -> None:
         pb.startjob()
         for batch_i in range(args.n_batch):
             try:
-                batch_x, batch_mask, batch_y, batch_red, batch_cur, batch_yv = next(train_iter)
+                batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, _batch_red, batch_yv = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                batch_x, batch_mask, batch_y, batch_red, batch_cur, batch_yv = next(train_iter)
-            x = batched_successors_nhwc_to_torch(
-                batch_x, device, pin_memory=pin_mem, non_blocking=pin_mem
-            )
+                batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, _batch_red, batch_yv = next(
+                    train_iter
+                )
             x_cur = batched_current_nhwc_to_torch(
                 batch_cur, device, pin_memory=pin_mem, non_blocking=pin_mem
             )
-            mask = torch.as_tensor(batch_mask, dtype=torch.bool)
-            target = torch.as_tensor(batch_y, dtype=torch.long)
-            red_b = torch.as_tensor(batch_red, dtype=torch.bool)
+            msrc = torch.as_tensor(batch_msrc, dtype=torch.bool)
+            mdst = torch.as_tensor(batch_mdst, dtype=torch.bool)
+            tgt_s = torch.as_tensor(batch_ys, dtype=torch.long)
+            tgt_d = torch.as_tensor(batch_yd, dtype=torch.long)
             target_v = torch.as_tensor(batch_yv, dtype=torch.long)
             if pin_mem:
-                mask = mask.pin_memory()
-                target = target.pin_memory()
-                red_b = red_b.pin_memory()
+                msrc = msrc.pin_memory()
+                mdst = mdst.pin_memory()
+                tgt_s = tgt_s.pin_memory()
+                tgt_d = tgt_d.pin_memory()
                 target_v = target_v.pin_memory()
-            mask = mask.to(device, non_blocking=pin_mem)
-            target = target.to(device, non_blocking=pin_mem)
-            red_b = red_b.to(device, non_blocking=pin_mem)
+            msrc = msrc.to(device, non_blocking=pin_mem)
+            mdst = mdst.to(device, non_blocking=pin_mem)
+            tgt_s = tgt_s.to(device, non_blocking=pin_mem)
+            tgt_d = tgt_d.to(device, non_blocking=pin_mem)
             target_v = target_v.to(device, non_blocking=pin_mem)
 
+            src_oh = F.one_hot(tgt_s, num_classes=POLICY_GRID_NUMEL).float()
             optimizer.zero_grad(set_to_none=True)
-            logits_p, logits_v = model(x, x_cur)
-            logits_r = logits_as_red_preference(logits_p, red_b)
-            logits_r = logits_r.masked_fill(~mask, -1e9)
-            loss_p = F.cross_entropy(logits_r, target)
+            logits_s, logits_d, logits_v = model(x_cur, src_oh)
+            loss_s = F.cross_entropy(logits_s.masked_fill(~msrc, -1e9), tgt_s)
+            loss_d = F.cross_entropy(logits_d.masked_fill(~mdst, -1e9), tgt_d)
+            loss_p = loss_s + loss_d
             labeled_v = target_v != VALUE_LABEL_IGNORE
             if labeled_v.any():
                 loss_v = F.cross_entropy(
@@ -331,24 +333,30 @@ def main() -> None:
             optimizer.step()
 
             with torch.no_grad():
-                acc = accuracy_from_logits_masked(logits_r, target, mask)
+                acc_s = accuracy_from_logits_masked(logits_s, tgt_s, msrc)
+                acc_d = accuracy_from_logits_masked(logits_d, tgt_d, mdst)
+                acc_j = joint_move_accuracy(logits_s, logits_d, msrc, mdst, tgt_s, tgt_d)
                 acc_v = value_accuracy_ignore(logits_v, target_v)
 
             global_step += 1
+            writer.add_scalar("train/loss_policy_src", float(loss_s.item()), global_step)
+            writer.add_scalar("train/loss_policy_dst", float(loss_d.item()), global_step)
             writer.add_scalar("train/loss_policy", float(loss_p.item()), global_step)
             writer.add_scalar("train/loss_value", float(loss_v.item()), global_step)
             writer.add_scalar("train/loss_total", float(loss.item()), global_step)
-            writer.add_scalar("train/acc_move_choice", float(acc.item()), global_step)
+            writer.add_scalar("train/acc_src", float(acc_s.item()), global_step)
+            writer.add_scalar("train/acc_dst", float(acc_d.item()), global_step)
+            writer.add_scalar("train/acc_move_joint", float(acc_j.item()), global_step)
             writer.add_scalar("train/acc_red_outcome", float(acc_v.item()), global_step)
             writer.add_scalar("train/lr", batch_lr, global_step)
 
-            expacc.update(float(acc.item()) * 100)
+            expacc.update(float(acc_j.item()) * 100)
             exploss.update(float(loss.item()))
             expacc_v.update(float(acc_v.item()) * 100)
             exploss_v.update(float(loss_v.item()))
             pb.info = (
                 f"EPOCH {epoch} STEP {batch_i} LR {batch_lr} "
-                f"ACCmv {expacc.getval()}% ACCout {expacc_v.getval()}% "
+                f"ACCjoint {expacc.getval()}% ACCout {expacc_v.getval()}% "
                 f"LOSS {exploss.getval()} (v {exploss_v.getval()}) "
             )
             pb.complete(args.batch_size)
@@ -365,33 +373,23 @@ def main() -> None:
         with torch.no_grad():
             for _ in range(args.n_batch_test):
                 try:
-                    batch_x, batch_mask, batch_y, batch_red, batch_cur, batch_yv = next(test_iter)
+                    batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, _br, batch_yv = next(test_iter)
                 except StopIteration:
                     test_iter = iter(test_loader)
-                    batch_x, batch_mask, batch_y, batch_red, batch_cur, batch_yv = next(test_iter)
-                x = batched_successors_nhwc_to_torch(
-                    batch_x, device, pin_memory=pin_mem, non_blocking=pin_mem
-                )
+                    batch_cur, batch_msrc, batch_mdst, batch_ys, batch_yd, _br, batch_yv = next(test_iter)
                 x_cur = batched_current_nhwc_to_torch(
                     batch_cur, device, pin_memory=pin_mem, non_blocking=pin_mem
                 )
-                mask = torch.as_tensor(batch_mask, dtype=torch.bool)
-                target = torch.as_tensor(batch_y, dtype=torch.long)
-                red_b = torch.as_tensor(batch_red, dtype=torch.bool)
-                target_v = torch.as_tensor(batch_yv, dtype=torch.long)
-                if pin_mem:
-                    mask = mask.pin_memory()
-                    target = target.pin_memory()
-                    red_b = red_b.pin_memory()
-                    target_v = target_v.pin_memory()
-                mask = mask.to(device, non_blocking=pin_mem)
-                target = target.to(device, non_blocking=pin_mem)
-                red_b = red_b.to(device, non_blocking=pin_mem)
-                target_v = target_v.to(device, non_blocking=pin_mem)
-                logits_p, logits_v = model(x, x_cur)
-                logits_r = logits_as_red_preference(logits_p, red_b)
-                logits_m = logits_r.masked_fill(~mask, -1e9)
-                loss_p = F.cross_entropy(logits_m, target)
+                msrc = torch.as_tensor(batch_msrc, dtype=torch.bool).to(device, non_blocking=pin_mem)
+                mdst = torch.as_tensor(batch_mdst, dtype=torch.bool).to(device, non_blocking=pin_mem)
+                tgt_s = torch.as_tensor(batch_ys, dtype=torch.long).to(device, non_blocking=pin_mem)
+                tgt_d = torch.as_tensor(batch_yd, dtype=torch.long).to(device, non_blocking=pin_mem)
+                target_v = torch.as_tensor(batch_yv, dtype=torch.long).to(device, non_blocking=pin_mem)
+                src_oh = F.one_hot(tgt_s, num_classes=POLICY_GRID_NUMEL).float()
+                logits_s, logits_d, logits_v = model(x_cur, src_oh)
+                loss_s = F.cross_entropy(logits_s.masked_fill(~msrc, -1e9), tgt_s)
+                loss_d = F.cross_entropy(logits_d.masked_fill(~mdst, -1e9), tgt_d)
+                loss_p = loss_s + loss_d
                 labeled_v = target_v != VALUE_LABEL_IGNORE
                 if labeled_v.any():
                     loss_v = F.cross_entropy(
@@ -400,16 +398,16 @@ def main() -> None:
                 else:
                     loss_v = (logits_v * 0).sum()
                 loss = loss_p + args.value_loss_weight * loss_v
-                acc = accuracy_from_logits_masked(logits_m, target, mask)
+                acc_j = joint_move_accuracy(logits_s, logits_d, msrc, mdst, tgt_s, tgt_d)
                 acc_v = value_accuracy_ignore(logits_v, target_v)
-                accs.append(float(acc.item()))
+                accs.append(float(acc_j.item()))
                 accs_v.append(float(acc_v.item()))
                 losses.append(float(loss.item()))
                 losses_p.append(float(loss_p.item()))
                 losses_v.append(float(loss_v.item()))
                 pb.complete(args.batch_size)
         print(
-            "TEST ACC(move)%",
+            "TEST ACC(joint move)%",
             100.0 * np.average(accs),
             "ACC(red-out)%",
             100.0 * np.average(accs_v),
@@ -423,7 +421,7 @@ def main() -> None:
         writer.add_scalar("val/loss_total", float(np.average(losses)), epoch)
         writer.add_scalar("val/loss_policy", float(np.average(losses_p)), epoch)
         writer.add_scalar("val/loss_value", float(np.average(losses_v)), epoch)
-        writer.add_scalar("val/acc_move_choice", float(np.average(accs)), epoch)
+        writer.add_scalar("val/acc_move_joint", float(np.average(accs)), epoch)
         writer.add_scalar("val/acc_red_outcome", float(np.average(accs_v)), epoch)
         print()
 

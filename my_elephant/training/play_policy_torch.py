@@ -1,6 +1,6 @@
 """
 Tkinter 图形对弈：圆形棋子、鼠标走子、对手上一手箭头提示；
-红/黑可分别选「人类」「纯网络」「MCTS+双头网络」。
+红/黑可分别选「人类」「纯网络」「MCTS+策略价值网络」。
 """
 from __future__ import annotations
 
@@ -16,19 +16,17 @@ import torch
 from my_elephant.chess import FEATURE_LIST, GamePlay
 from my_elephant.chess.features import parse_move_squares
 from my_elephant.chess.rationale import POLICY_SELECT_IN_CHANNELS
-from my_elephant.chess.xml_samples import successor_planes_for_legals
 from my_elephant.training.mcts_engine import copy_gameplay, mcts_search
 from my_elephant.training.policy_torch import (
     SuccessorPolicy,
-    batched_successors_nhwc_to_torch,
     eval_policy_value_at_root,
-    logits_as_red_preference,
+    infer_greedy_move_string,
     torch_load_checkpoint,
 )
 
 STRATEGY_HUMAN = "人类"
 STRATEGY_NEURAL = "纯网络"
-STRATEGY_MCTS = "MCTS+双头网络"
+STRATEGY_MCTS = "MCTS+策略价值网络"
 STRATEGIES = (STRATEGY_HUMAN, STRATEGY_NEURAL, STRATEGY_MCTS)
 
 # 棋子显示（红大写 / 黑小写 → 同一汉字，靠颜色区分）
@@ -64,19 +62,11 @@ def _piece_side(ch: str | None) -> str | None:
 
 
 def _neural_pick_move(gp: GamePlay, model: SuccessorPolicy, device: torch.device, flist: dict) -> str:
-    legals_t = sorted(gp.legal_moves_iccs())
-    if not legals_t:
-        raise RuntimeError("无合法着法")
-    legals_s = [f"{a}{b}-{c}{d}" for (a, b, c, d) in legals_t]
-    planes_k = successor_planes_for_legals(gp.bb, legals_t, flist)
-    x_hwc = np.transpose(planes_k, (0, 2, 3, 1))
-    x = np.expand_dims(x_hwc, axis=0)
-    xt = batched_successors_nhwc_to_torch(x, device)
-    logits = model.predict_move_logits(xt)
-    red = gp.get_side() == "red"
-    logits_r = logits_as_red_preference(logits, red)
-    li = int(torch.argmax(logits_r).item())
-    return legals_s[li]
+    mv = infer_greedy_move_string(gp, model, device, flist)
+    legals = {f"{a}{b}-{c}{d}" for (a, b, c, d) in gp.legal_moves_iccs()}
+    if mv not in legals:
+        raise RuntimeError(f"网络贪心着法不在合法集中: {mv!r}")
+    return mv
 
 
 class XiangqiTkApp:
@@ -330,7 +320,7 @@ class XiangqiTkApp:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Tkinter 图形对弈（策略 / MCTS+双头）")
+    p = argparse.ArgumentParser(description="Tkinter 图形对弈（策略 / MCTS+策略价值）")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--gpu", type=int, default=0, help="-1 为 CPU")
     p.add_argument("--in-channels", type=int, default=None)

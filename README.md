@@ -2,19 +2,19 @@
 
 在 [Icy Elephant](https://github.com/bupticybee/icyElephant) 思路上整理的中国象棋 **PyTorch 策略 + 价值训练 / 图形对弈** 代码：
 
-- **策略头**：合法着法枚举 → 每个着法的**走后局面** → **7 路有符号兵种输入**（红 +1 / 黑 −1，固定红方棋盘视角）→ 每着法标量 logit；棋谱着法为交叉熵标签。
-- **价值头**：走棋前当前局面经同一主干，输出红方 **胜 / 和 / 负** 三分类 logit，与棋谱 `Head/RecordResult` 对齐做交叉熵（无标签样本忽略）。
-- 走棋方不进网络；着法侧用 `logits_as_red_preference`（红 `argmax` raw、黑等价于 `argmax(-raw)`）与损失对齐。
+- **策略头（与 UI 一致：先选子再选落点）**：仅用走棋前当前局面的 **7 路有符号兵种平面**（红 +1 / 黑 −1，固定红方棋盘视角）过共享卷积主干 → **起点格** 90 类（ICCS 展平 `y*9+x`）+ 在 teacher/推理给定起点 one-hot 后 **落点格** 90 类；训练时对起点、落点各做交叉熵（落点 mask 为「在棋谱真实起点下」的合法到达格）。
+- **价值头**：同一主干池化后输出红方 **胜 / 和 / 负** 三分类 logit，与棋谱 `Head/RecordResult` 对齐做交叉熵（无标签样本忽略）。
+- 走棋方不进平面编码；MCTS / 纯网络走子用分解式 `P(着)=P(起点)P(落点|起点)` 在合法着集合上归一化得到 prior。
 
 ## 目录
 
 | 路径 | 说明 |
 |------|------|
 | `cchess/` | 规则引擎与棋谱读取（GPL，与上游一致）。 |
-| `my_elephant/chess/` | 盘面编码、`convert_game`、`successor_planes_for_legals`、`GamePlay`、`red_outcome_class_from_head` 等。 |
+| `my_elephant/chess/` | 盘面编码、`convert_game`（两阶段标签）、`iccs_flat_index`、`src_dst_masks_and_labels`、`successor_planes_for_legals`（遗留）、`GamePlay` 等。 |
 | `my_elephant/datasets/` | `ProgressBar` 等训练辅助。 |
 | `my_elephant/data_prep/` | 生成 train/test 路径清单等 CLI（`split_manifest`）。 |
-| `my_elephant/training/` | `SuccessorPolicy`（双头）、`policy_data`（`DataLoader` + `IterableDataset`）、`mcts_engine`（PUCT MCTS）、`train_policy_torch` / `play_policy_torch`。 |
+| `my_elephant/training/` | `SuccessorPolicy`（起点+落点+价值）、`policy_data`、`mcts_engine`（PUCT MCTS）、`train_policy_torch` / `play_policy_torch`。 |
 
 推荐：`from my_elephant import GamePlay, convert_game, successor_planes_for_legals`。
 
@@ -70,7 +70,7 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 | `--batch-size` | 每步 batch 大小 |
 | `--num-workers` | `DataLoader` 子进程数；**默认** `min(8, CPU 核数)`，`0` 表示主进程加载 |
 | `--prefetch-factor` | 每 worker 预取 batch 数（`num_workers>0` 时） |
-| `--value-loss-weight` | 价值头 CE 相对策略 CE 的权重（默认 `0.5`） |
+| `--value-loss-weight` | 价值头 CE 相对策略损失（起点 CE + 落点 CE）的权重（默认 `0.5`） |
 | `--continue` | 续训：自动加载 `models/<model-name>/last.pt`（见上文） |
 | `--resume` | 从指定 `.pt` 恢复；权重在 **CPU** 上加载后再 `model.to(device)`；与 `--continue` 同时存在时优先本项 |
 
@@ -80,7 +80,7 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 
 ## 对弈（Tkinter）
 
-`play_policy_torch` 为 **图形界面**：圆形棋子、鼠标选子再走子；**箭头**标示上一手起点→终点；红/黑可分别选择 **人类**、**纯网络**、**MCTS+双头网络**。MCTS 在后台线程运行，避免卡 UI。
+`play_policy_torch` 为 **图形界面**：圆形棋子、鼠标选子再走子；**箭头**标示上一手起点→终点；红/黑可分别选择 **人类**、**纯网络**、**MCTS+策略价值网络**。MCTS 在后台线程运行，避免卡 UI。
 
 ```bash
 python -m my_elephant.training.play_policy_torch --checkpoint models/my_run/best.pt

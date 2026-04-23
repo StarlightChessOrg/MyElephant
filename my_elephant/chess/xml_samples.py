@@ -19,6 +19,7 @@ from cchess.piece import ChessSide
 
 from my_elephant.chess.features import encode_model_planes, parse_move_squares
 from my_elephant.chess.rationale import (
+    POLICY_GRID_NUMEL,
     POLICY_MAX_LEGAL_MOVES,
     POLICY_SELECT_IN_CHANNELS,
     RED_OUTCOME_DRAW,
@@ -27,6 +28,31 @@ from my_elephant.chess.rationale import (
     VALUE_LABEL_IGNORE,
 )
 from my_elephant.chess.session import legal_moves_iccs_for_board
+
+
+def iccs_flat_index(x: int, y: int) -> int:
+    """ICCS 坐标展平下标：``y * 9 + x``，范围 ``0..89``。"""
+    return int(y) * 9 + int(x)
+
+
+def src_dst_masks_and_labels(
+    legals: list[tuple[int, int, int, int]], played: tuple[int, int, int, int]
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """合法着列表与棋谱着法 → 起点格 mask(90)、在真起点下的落点格 mask(90)、起点/落点类下标。"""
+    src_mask = np.zeros(POLICY_GRID_NUMEL, dtype=np.bool_)
+    for x1, y1, _, _ in legals:
+        src_mask[iccs_flat_index(x1, y1)] = True
+    px1, py1, px2, py2 = played
+    dst_mask = np.zeros(POLICY_GRID_NUMEL, dtype=np.bool_)
+    for x1, y1, x2, y2 in legals:
+        if (x1, y1) == (px1, py1):
+            dst_mask[iccs_flat_index(x2, y2)] = True
+    return (
+        src_mask,
+        dst_mask,
+        iccs_flat_index(px1, py1),
+        iccs_flat_index(px2, py2),
+    )
 
 
 def successor_planes_for_legals(
@@ -100,18 +126,20 @@ def red_outcome_class_from_head(head: Any) -> int:
 def convert_game(
     onefile: str | Path,
     feature_list: Mapping[str, list[str]],
-) -> Iterator[tuple[np.ndarray, int, int, bool, np.ndarray, int]]:
+) -> Iterator[
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.int64, np.int64, bool, int]
+]:
     """
-    逐步回放棋局。在棋谱着法执行前，枚举当前所有合法着法；对每个着法在**走完后的局面**
-    上调用 `encode_model_planes` 得到平面，堆叠为 (K, C, 10, 9)。
+    逐步回放棋局。在棋谱着法执行前，用**走棋前当前局面**训练「先选起点格、再选落点格」两阶段策略头。
 
     Yields:
-        planes: (K, C, 10, 9) float32，K 为合法着法数（未填充）
-        k_valid: K
-        label_idx: 棋谱着法在 sorted(legals) 中的下标
-        red_to_move: 走棋**之前**是否轮到红方（用于将 raw logit 解释为「对红方偏好」：红方 argmax、黑方 argmin）
-        current_chw: (C, 10, 9) float32，走棋前当前局面编码
-        outcome_cls: 红方胜/和/负类下标，或 ``VALUE_LABEL_IGNORE`` 表示无 ``RecordResult`` 标签
+        cur_hwc: (10, 9, C) float32，走棋前 ``encode_model_planes`` 转 HWC
+        src_mask: (90,) bool，可为起点的 ICCS 格（至少一着合法出发）
+        dst_mask: (90,) bool，在**棋谱真实起点**下可达的落点格
+        src_label: 起点展平下标 ``y*9+x``
+        dst_label: 落点展平下标
+        red_to_move: 走棋**之前**是否轮到红方
+        outcome_cls: 红方胜/和/负类下标，或 ``VALUE_LABEL_IGNORE``
     """
     doc = _load_record(onefile)
     head = doc["ChineseChessRecord"]["Head"]
@@ -140,13 +168,19 @@ def convert_game(
         played = (x1, y1, x2, y2)
         if played not in legals:
             raise ValueError(f"棋谱着法不在合法列表中: {mv!r} file={onefile!r}")
-        label_idx = legals.index(played)
-
-        planes = successor_planes_for_legals(bb, legals, feature_list)
-        k_valid = int(planes.shape[0])
+        src_mask, dst_mask, li_s, li_d = src_dst_masks_and_labels(legals, played)
+        cur_hwc = np.transpose(current_chw, (1, 2, 0))
 
         moveresult = bb.move(Pos(x1, y1), Pos(x2, y2))
         assert moveresult is not None
         bb.next_turn()
 
-        yield planes, k_valid, label_idx, red_to_move, current_chw, outcome_cls
+        yield (
+            cur_hwc.astype(np.float32, copy=False),
+            src_mask,
+            dst_mask,
+            np.int64(li_s),
+            np.int64(li_d),
+            red_to_move,
+            outcome_cls,
+        )
