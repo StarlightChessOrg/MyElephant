@@ -11,10 +11,10 @@
 | 路径 | 说明 |
 |------|------|
 | `cchess/` | 规则引擎与棋谱读取（GPL，与上游一致）。 |
-| `my_elephant/chess/` | 盘面编码、`convert_game`（两阶段标签）、`iccs_flat_index`、`src_dst_masks_and_labels`、`successor_planes_for_legals`（遗留）、`GamePlay` 等。 |
-| `my_elephant/datasets/` | `ProgressBar` 等训练辅助。 |
-| `my_elephant/data_prep/` | 生成 train/test 路径清单等 CLI（`split_manifest`）。 |
-| `my_elephant/training/` | `SuccessorPolicy`（起点+落点+价值）、`policy_data`、`mcts_engine`（PUCT MCTS）、`train_policy_torch` / `play_policy_torch`。 |
+| `my_elephant/chess/` | 盘面编码、`convert_game`（两阶段标签）、`iccs_flat_index`、`src_dst_masks_and_labels`、`successor_planes_for_legals`（遗留）、`GamePlay`、`mcts_prior_shaping`（MCTS 先验整形）等。 |
+| `my_elephant/datasets/` | `batching`：`Dataset` / `ImageClass` / `ProgressBar` / `get_dataset` / `split_dataset`。 |
+| `my_elephant/data_prep/` | `split_manifest`（`my-split-cbf-lists`）、`imsa_catalog`（`my-collect-playbook-ids`）等 CLI。 |
+| `my_elephant/training/` | `policy_torch`（`SuccessorPolicy`：起点+落点+价值）、`policy_data`、`mcts_engine`（PUCT）、`train_policy_torch`、`play_policy_torch`、`play_model_loader`、`policy_eval_worker` / `policy_eval_http`（可选多进程 HTTP 前向）。 |
 
 推荐：`from my_elephant import GamePlay, convert_game, successor_planes_for_legals`。
 
@@ -115,6 +115,7 @@ python -m my_elephant.training.play_policy_torch --checkpoint models/my_run/best
 
 ## 说明
 
+- 训练以棋谱监督为主；**不含**并行 MCTS 自对弈 + 遗传算法微调入口（无对应脚本/模块）。
 - 原始数据链接可参考 Icy Elephant README / 百度盘说明；本仓库不附带棋谱二进制。
 - 若 `cchess` 在 Python 3 下导入失败（如 `sets` 模块），需按 Python 3 兼容性修补 `cchess/piece.py` 等文件。
 - 网上常把象棋桥 **`.cbr`/`.cbl` 二进制** 称作棋谱格式；与本仓库 **XML `.cbf`** 不是同一格式。
