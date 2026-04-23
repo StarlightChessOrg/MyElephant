@@ -76,6 +76,17 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 
 数据管线使用 **`torch.utils.data.DataLoader` + `IterableDataset`**：多 worker 按文件列表分片并行读盘与解析；`worker_init_fn` 限制各进程 BLAS 线程数；CUDA 时可传 **`pin_memory_device`**；训练集默认 **`drop_last=True`**。
 
+### 训练日志指标（`ACCjoint` / `ACCout`）
+
+控制台进度条里的 **`ACCjoint`**、**`ACCout`** 为滑动平均（百分比），含义如下：
+
+| 简称 | 含义 | 与 TensorBoard / 验证打印的对应 |
+|------|------|--------------------------------|
+| **ACCjoint** | **整着联合准确率**：对每个样本，在合法起点 mask 上做 `argmax` 得到预测起点、在「该局面下、棋谱真实起点对应的合法落点」mask 上做 `argmax` 得到预测落点；**两者同时等于棋谱标签**的样本占比。等价于「两阶段分类都对」才算对一步棋。 | `train/acc_move_joint`、`val/acc_move_joint`；验证结束时的 `TEST ACC(joint move)%` |
+| **ACCout** | **红方终局（outcome）准确率**：价值头对 **红胜 / 和 / 红负** 三类的 `argmax` 是否与棋谱 `RecordResult` 映射后的标签一致；**无终局标签的样本**（`RecordResult` 为 `0` 或缺失等，内部为 `VALUE_LABEL_IGNORE`）**不参与统计**（若整批都无标签则该批记为 0）。 | `train/acc_red_outcome`、`val/acc_red_outcome`；验证结束时的 `ACC(red-out)%` |
+
+补充：除联合指标外，训练还会记录 **`train/acc_src`**、**`train/acc_dst`**（仅起点对、仅落点对的边际准确率；落点头训练时使用 **棋谱真实起点** 的 one-hot，与 `ACCjoint` 的判定一致）。
+
 也可使用入口：`my-train-policy --model-name my_run`。
 
 ## 对弈（Tkinter）
