@@ -78,12 +78,17 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 
 ### 训练日志指标（`ACCjoint` / `ACCout`）
 
-控制台进度条里的 **`ACCjoint`**、**`ACCout`** 为滑动平均（百分比），含义如下：
+控制台进度条里的 **`ACCjoint`** 为指数平滑（百分比）；**`ACCout`** 同样为指数平滑，但**仅在有终局标签的 batch 上更新**（若尚未遇到带标签 batch 会显示 `n/a`）。含义如下：
 
 | 简称 | 含义 | 与 TensorBoard / 验证打印的对应 |
 |------|------|--------------------------------|
 | **ACCjoint** | **整着联合准确率**：对每个样本，在合法起点 mask 上做 `argmax` 得到预测起点、在「该局面下、棋谱真实起点对应的合法落点」mask 上做 `argmax` 得到预测落点；**两者同时等于棋谱标签**的样本占比。等价于「两阶段分类都对」才算对一步棋。 | `train/acc_move_joint`、`val/acc_move_joint`；验证结束时的 `TEST ACC(joint move)%` |
-| **ACCout** | **红方终局（outcome）准确率**：价值头对 **红胜 / 和 / 红负** 三类的 `argmax` 是否与棋谱 `RecordResult` 映射后的标签一致；**无终局标签的样本**（`RecordResult` 为 `0` 或缺失等，内部为 `VALUE_LABEL_IGNORE`）**不参与统计**（若整批都无标签则该批记为 0）。 | `train/acc_red_outcome`、`val/acc_red_outcome`；验证结束时的 `ACC(red-out)%` |
+| **ACCout** | **红方终局（outcome）准确率**：价值头对 **红胜 / 和 / 红负** 三类的 `argmax` 是否与棋谱 `RecordResult` 映射后的标签一致；**无终局标签的样本**（`RecordResult` 为 `0` 或缺失等，内部为 `VALUE_LABEL_IGNORE`）**不参与分子与分母**。 | `train/acc_red_outcome`、`val/acc_red_outcome`（仅在有标注的 step / 验证集上至少有一个标注样本时写入）；验证结束时的 `ACC(red-out)%` 为**整轮验证中所有带标签样本**上的 micro 准确率 |
+
+**为何不能和「随机猜 33%」直接比？**
+
+- **`ACCjoint` 不是三分类**：一着棋往往在几十种合法着之间；若均匀随机**一整着**（先随机合法起点再随机该起点下的合法落点），联合命中率大致 \(\sim 1 / L\)（\(L\) 为局面合法着数，常远大于 3），**个位数百分比并不反常**。若只随机「落点」而起点碰巧猜对，也不等于 `ACCjoint` 的判定方式。
+- **`ACCout` 才是三分类**：在**仅有标签的样本**上，瞎猜且三类均衡时期望约 **33%**。棋谱里三类往往**不均衡**（且标签缺失很多），基线不一定是 33%。进度条里的 `ACCout` 已与 TensorBoard 一致：**不含标签的 batch 不再把「无标签」当成 0% 混进滑动平均**，因此不会再出现「明明接近随机、却长期只有百分之几」的假象。
 
 补充：除联合指标外，训练还会记录 **`train/acc_src`**、**`train/acc_dst`**（仅起点对、仅落点对的边际准确率；落点头训练时使用 **棋谱真实起点** 的 one-hot，与 `ACCjoint` 的判定一致）。
 

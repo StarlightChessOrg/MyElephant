@@ -342,32 +342,37 @@ def main() -> None:
             writer.add_scalar("train/loss_policy_src", float(loss_s.item()), global_step)
             writer.add_scalar("train/loss_policy_dst", float(loss_d.item()), global_step)
             writer.add_scalar("train/loss_policy", float(loss_p.item()), global_step)
-            writer.add_scalar("train/loss_value", float(loss_v.item()), global_step)
             writer.add_scalar("train/loss_total", float(loss.item()), global_step)
             writer.add_scalar("train/acc_src", float(acc_s.item()), global_step)
             writer.add_scalar("train/acc_dst", float(acc_d.item()), global_step)
             writer.add_scalar("train/acc_move_joint", float(acc_j.item()), global_step)
-            writer.add_scalar("train/acc_red_outcome", float(acc_v.item()), global_step)
             writer.add_scalar("train/lr", batch_lr, global_step)
+            # 无终局标签的 batch 里 acc_v 被定义为 0；不参与 TensorBoard / 进度条 EMA，否则会远低于随机三分类基线。
+            if labeled_v.any():
+                writer.add_scalar("train/loss_value", float(loss_v.item()), global_step)
+                writer.add_scalar("train/acc_red_outcome", float(acc_v.item()), global_step)
+                expacc_v.update(float(acc_v.item()) * 100)
+                exploss_v.update(float(loss_v.item()))
 
             expacc.update(float(acc_j.item()) * 100)
             exploss.update(float(loss.item()))
-            expacc_v.update(float(acc_v.item()) * 100)
-            exploss_v.update(float(loss_v.item()))
+            out_pct = f"{expacc_v.getval()}%" if expacc_v.val is not None else "n/a"
+            vloss_s = f"{exploss_v.getval()}" if exploss_v.val is not None else "n/a"
             pb.info = (
                 f"EPOCH {epoch} STEP {batch_i} LR {batch_lr} "
-                f"ACCjoint {expacc.getval()}% ACCout {expacc_v.getval()}% "
-                f"LOSS {exploss.getval()} (v {exploss_v.getval()}) "
+                f"ACCjoint {expacc.getval()}% ACCout {out_pct} "
+                f"LOSS {exploss.getval()} (v {vloss_s}) "
             )
             pb.complete(args.batch_size)
         print()
 
         model.eval()
         accs: list[float] = []
-        accs_v: list[float] = []
         losses: list[float] = []
         losses_p: list[float] = []
         losses_v: list[float] = []
+        val_v_correct = 0
+        val_v_total = 0
         pb = ProgressBar(worksum=args.n_batch_test * args.batch_size, info=f"validating epoch {epoch}")
         pb.startjob()
         with torch.no_grad():
@@ -399,30 +404,37 @@ def main() -> None:
                     loss_v = (logits_v * 0).sum()
                 loss = loss_p + args.value_loss_weight * loss_v
                 acc_j = joint_move_accuracy(logits_s, logits_d, msrc, mdst, tgt_s, tgt_d)
-                acc_v = value_accuracy_ignore(logits_v, target_v)
                 accs.append(float(acc_j.item()))
-                accs_v.append(float(acc_v.item()))
                 losses.append(float(loss.item()))
                 losses_p.append(float(loss_p.item()))
-                losses_v.append(float(loss_v.item()))
+                if labeled_v.any():
+                    losses_v.append(float(loss_v.item()))
+                    m = labeled_v
+                    pred = logits_v[m].argmax(dim=1)
+                    val_v_correct += int((pred == target_v[m]).sum().item())
+                    val_v_total += int(m.sum().item())
                 pb.complete(args.batch_size)
+        val_acc_v = (val_v_correct / val_v_total) if val_v_total else float("nan")
+        val_loss_v = float(np.average(losses_v)) if losses_v else float("nan")
         print(
             "TEST ACC(joint move)%",
             100.0 * np.average(accs),
             "ACC(red-out)%",
-            100.0 * np.average(accs_v),
+            (100.0 * val_acc_v) if val_v_total else float("nan"),
             "LOSS total",
             np.average(losses),
             "LOSS pol",
             np.average(losses_p),
             "LOSS val",
-            np.average(losses_v),
+            val_loss_v,
         )
         writer.add_scalar("val/loss_total", float(np.average(losses)), epoch)
         writer.add_scalar("val/loss_policy", float(np.average(losses_p)), epoch)
-        writer.add_scalar("val/loss_value", float(np.average(losses_v)), epoch)
+        if losses_v:
+            writer.add_scalar("val/loss_value", val_loss_v, epoch)
         writer.add_scalar("val/acc_move_joint", float(np.average(accs)), epoch)
-        writer.add_scalar("val/acc_red_outcome", float(np.average(accs_v)), epoch)
+        if val_v_total:
+            writer.add_scalar("val/acc_red_outcome", float(val_acc_v), epoch)
         print()
 
         val_loss = float(np.average(losses))
