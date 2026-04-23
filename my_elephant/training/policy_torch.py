@@ -26,6 +26,18 @@ def default_transformer_nhead(d_model: int) -> int:
     return 1
 
 
+def count_hybrid_stem_res_blocks_in_state(sd: dict, prefix: str = "hybrid_trunk.stem_res.") -> int:
+    mx = -1
+    for k in sd:
+        if not k.startswith(prefix):
+            continue
+        rest = k[len(prefix) :]
+        lead = rest.split(".", 1)[0]
+        if lead.isdigit():
+            mx = max(mx, int(lead))
+    return mx + 1 if mx >= 0 else 0
+
+
 def count_transformer_encoder_layers_in_state(sd: dict, prefix: str = "xfm_trunk.encoder.layers.") -> int:
     mx = -1
     for k in sd:
@@ -120,6 +132,71 @@ class TransformerBoardTrunk(nn.Module):
         return z.mean(dim=1)
 
 
+class HybridBoardTrunk(nn.Module):
+    """
+    先用卷积 stem + 若干 ``ResBlock`` 在格网上提取局部、混叠通道（稀疏平面 → 每格稠密向量），
+    再展平为 90 个 token，加位置编码后走 ``TransformerEncoder``，最后对 token 均值池化。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        filters: int,
+        stem_res_blocks: int,
+        num_transformer_layers: int,
+        nhead: int,
+        dim_feedforward: int,
+        board_h: int = 10,
+        board_w: int = 9,
+        dropout: float = 0.05,
+    ) -> None:
+        super().__init__()
+        if filters % nhead != 0:
+            raise ValueError(f"filters(=d_model)={filters} 必须能被 nhead={nhead} 整除")
+        if stem_res_blocks < 0:
+            raise ValueError("stem_res_blocks 须 >= 0")
+        self.in_channels = in_channels
+        self.filters = filters
+        self.stem_res_blocks = stem_res_blocks
+        self.num_transformer_layers = num_transformer_layers
+        self.nhead = nhead
+        self.dim_feedforward = dim_feedforward
+        self.board_h = board_h
+        self.board_w = board_w
+        self.n_tokens = board_h * board_w
+        self.stem_conv = nn.Conv2d(in_channels, filters, 3, padding=1, bias=False)
+        self.stem_bn = nn.BatchNorm2d(filters)
+        self.stem_res = nn.Sequential(*[ResBlock(filters) for _ in range(stem_res_blocks)])
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_tokens, filters))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=filters,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_transformer_layers)
+        self.out_norm = nn.LayerNorm(filters)
+
+    def forward(self, x_nchw: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x_nchw.shape
+        if h * w != self.n_tokens or c != self.in_channels:
+            raise ValueError(
+                f"期望输入空间 {self.board_h}x{self.board_w}、通道 {self.in_channels}，"
+                f"收到 {h}x{w}、C={c}"
+            )
+        t = F.elu(self.stem_bn(self.stem_conv(x_nchw)))
+        t = self.stem_res(t)
+        seq = t.flatten(2).transpose(1, 2)
+        z = seq + self.pos_embed
+        z = self.encoder(z)
+        z = self.out_norm(z)
+        return z.mean(dim=1)
+
+
 class SuccessorPolicy(nn.Module):
     """
     共享 trunk 读走棋前当前局面 ``(B,C,10,9)``：
@@ -127,8 +204,10 @@ class SuccessorPolicy(nn.Module):
     - ``head_dst``：在 teacher/推理给定起点 one-hot 拼接后，90 维选落点格；
     - ``value_head``：红方胜/和/负三分类。
 
-    ``backbone="transformer"``（默认）：板面 90 token + 多头自注意力编码，``filters`` 用作 ``d_model``；
-    ``backbone="resnet"``：原 3x3 卷积残差塔（与旧 checkpoint 键名兼容）。
+    ``backbone="hybrid"``（默认）：卷积 stem + ``stem_res_blocks`` 个 ``ResBlock`` 提取格网特征，
+    再展平为 token 接 ``TransformerEncoder``；``filters`` 同时为卷积宽度与注意力 ``d_model``。
+    ``backbone="transformer"``：原始通道直接线性嵌入为 token + Transformer。
+    ``backbone="resnet"``：仅 3x3 卷积残差塔 + GAP（与旧 checkpoint 键名兼容）。
     """
 
     def __init__(
@@ -137,7 +216,8 @@ class SuccessorPolicy(nn.Module):
         in_channels: int | None = None,
         filters: int = 256,
         grid: int = POLICY_GRID_NUMEL,
-        backbone: str = "transformer",
+        backbone: str = "hybrid",
+        stem_res_blocks: int = 2,
         nhead: int | None = None,
         dim_feedforward: int | None = None,
         transformer_dropout: float = 0.05,
@@ -147,9 +227,10 @@ class SuccessorPolicy(nn.Module):
         self.in_channels = c
         self.grid = grid
         self.filters = filters
+        self.stem_res_blocks = int(stem_res_blocks)
         bkb = backbone.lower().strip()
-        if bkb not in ("transformer", "resnet"):
-            raise ValueError(f"未知 backbone={backbone!r}，请用 transformer 或 resnet")
+        if bkb not in ("hybrid", "transformer", "resnet"):
+            raise ValueError(f"未知 backbone={backbone!r}，请用 hybrid、transformer 或 resnet")
         self.backbone_name = bkb
 
         if bkb == "transformer":
@@ -161,6 +242,20 @@ class SuccessorPolicy(nn.Module):
                 in_channels=c,
                 d_model=filters,
                 num_layers=num_res_layers,
+                nhead=nh,
+                dim_feedforward=ff,
+                dropout=transformer_dropout,
+            )
+        elif bkb == "hybrid":
+            nh = int(nhead) if nhead is not None else default_transformer_nhead(filters)
+            if filters % nh != 0:
+                raise ValueError(f"filters(=d_model)={filters} 必须能被 nhead={nh} 整除，可改 --nhead")
+            ff = int(dim_feedforward) if dim_feedforward is not None else max(128, 4 * filters)
+            self.hybrid_trunk = HybridBoardTrunk(
+                in_channels=c,
+                filters=filters,
+                stem_res_blocks=self.stem_res_blocks,
+                num_transformer_layers=num_res_layers,
                 nhead=nh,
                 dim_feedforward=ff,
                 dropout=transformer_dropout,
@@ -179,6 +274,9 @@ class SuccessorPolicy(nn.Module):
         if self.backbone_name == "transformer":
             assert self.xfm_trunk is not None
             return self.xfm_trunk(x_nchw)
+        if self.backbone_name == "hybrid":
+            assert self.hybrid_trunk is not None
+            return self.hybrid_trunk(x_nchw)
         assert self.stem_conv is not None and self.stem_bn is not None
         assert self.blocks is not None and self.pool is not None
         t = F.elu(self.stem_bn(self.stem_conv(x_nchw)))

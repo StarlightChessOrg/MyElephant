@@ -27,6 +27,7 @@ from my_elephant.training.policy_torch import (
     SuccessorPolicy,
     accuracy_from_logits_masked,
     batched_current_nhwc_to_torch,
+    count_hybrid_stem_res_blocks_in_state,
     count_transformer_encoder_layers_in_state,
     joint_move_accuracy,
     torch_load_checkpoint,
@@ -90,26 +91,33 @@ def _parse_args() -> argparse.Namespace:
         "--num-res-layers",
         type=int,
         default=4,
-        help="主干深度：ResNet 时为残差块数；Transformer 时为 encoder 层数（默认较小以便 MCTS 多次前向）",
+        help="主干深度：ResNet 时为残差块数；hybrid/transformer 时为 Transformer encoder 层数（默认较小以便 MCTS 多次前向）",
     )
     p.add_argument(
         "--filters",
         type=int,
         default=64,
-        help="ResNet 时为卷积宽度；Transformer 时为 d_model（嵌入与注意力维度；旧 checkpoint 请与训练时一致）",
+        help="ResNet 时为卷积宽度；hybrid/transformer 时为卷积宽度及 Transformer d_model（旧 checkpoint 请与训练时一致）",
     )
     p.add_argument(
         "--backbone",
         type=str,
-        default="transformer",
-        choices=("transformer", "resnet"),
-        help="编码器：板面 token 多头自注意力（默认）或原 3x3 卷积残差塔",
+        default="hybrid",
+        choices=("hybrid", "transformer", "resnet"),
+        help="hybrid=少量 ResBlock 提特征后接 Transformer（默认）；transformer=纯 token；resnet=纯卷积塔",
+    )
+    p.add_argument(
+        "--stem-res-blocks",
+        type=int,
+        default=2,
+        dest="stem_res_blocks",
+        help="仅 hybrid：卷积段 ResBlock 层数（默认 2；0 表示仅 stem 后接 Transformer）",
     )
     p.add_argument(
         "--nhead",
         type=int,
         default=None,
-        help="Transformer 多头数（须整除 --filters）；默认自动选取",
+        help="hybrid/transformer 多头数（须整除 --filters）；默认自动选取",
     )
     p.add_argument(
         "--dim-feedforward",
@@ -224,6 +232,8 @@ def main() -> None:
             sd = {}
         if ckpt.get("backbone") is not None:
             args.backbone = str(ckpt["backbone"])
+        elif any(k.startswith("hybrid_trunk.") for k in sd):
+            args.backbone = "hybrid"
         elif any(k.startswith("xfm_trunk.") for k in sd):
             args.backbone = "transformer"
         elif "stem_conv.weight" in sd:
@@ -237,8 +247,8 @@ def main() -> None:
             if args.in_channels is not None
             else int(ckpt.get("in_channels", ckpt.get("select_in_channels", POLICY_SELECT_IN_CHANNELS)))
         )
-        if isinstance(sd, dict) and "stem_conv.weight" in sd:
-            inferred_f = int(sd["stem_conv.weight"].shape[0])
+        if isinstance(sd, dict) and "hybrid_trunk.stem_conv.weight" in sd:
+            inferred_f = int(sd["hybrid_trunk.stem_conv.weight"].shape[0])
             if ckpt.get("filters") is not None:
                 args.filters = int(ckpt["filters"])
             else:
@@ -249,10 +259,25 @@ def main() -> None:
                 args.filters = int(ckpt["filters"])
             else:
                 args.filters = inferred_f
+        elif isinstance(sd, dict) and "stem_conv.weight" in sd:
+            inferred_f = int(sd["stem_conv.weight"].shape[0])
+            if ckpt.get("filters") is not None:
+                args.filters = int(ckpt["filters"])
+            else:
+                args.filters = inferred_f
+        if ckpt.get("stem_res_blocks") is not None:
+            args.stem_res_blocks = int(ckpt["stem_res_blocks"])
+        elif args.backbone == "hybrid" and isinstance(sd, dict):
+            args.stem_res_blocks = count_hybrid_stem_res_blocks_in_state(sd)
         if ckpt.get("num_res_layers") is not None:
             args.num_res_layers = int(ckpt["num_res_layers"])
-        elif getattr(args, "backbone", "") == "transformer" and isinstance(sd, dict):
-            nlay = count_transformer_encoder_layers_in_state(sd)
+        elif isinstance(sd, dict) and args.backbone in ("transformer", "hybrid"):
+            pref = (
+                "hybrid_trunk.encoder.layers."
+                if args.backbone == "hybrid"
+                else "xfm_trunk.encoder.layers."
+            )
+            nlay = count_transformer_encoder_layers_in_state(sd, pref)
             if nlay > 0:
                 args.num_res_layers = nlay
     else:
@@ -292,6 +317,7 @@ def main() -> None:
         in_channels=in_ch,
         filters=args.filters,
         backbone=args.backbone,
+        stem_res_blocks=args.stem_res_blocks,
         nhead=args.nhead,
         dim_feedforward=args.dim_feedforward,
         transformer_dropout=args.transformer_dropout,
@@ -302,6 +328,12 @@ def main() -> None:
         print(
             f"[model] backbone=transformer d_model={args.filters} layers={args.num_res_layers} "
             f"nhead={xf.nhead} dim_ff={xf.dim_feedforward} params={nparam:,}"
+        )
+    elif args.backbone == "hybrid" and getattr(model, "hybrid_trunk", None) is not None:
+        ht = model.hybrid_trunk
+        print(
+            f"[model] backbone=hybrid filters={args.filters} stem_res={args.stem_res_blocks} "
+            f"xfm_layers={args.num_res_layers} nhead={ht.nhead} dim_ff={ht.dim_feedforward} params={nparam:,}"
         )
     else:
         print(
@@ -523,6 +555,11 @@ def main() -> None:
         if args.backbone == "transformer" and getattr(model, "xfm_trunk", None) is not None:
             payload["nhead"] = model.xfm_trunk.nhead
             payload["dim_feedforward"] = model.xfm_trunk.dim_feedforward
+        elif args.backbone == "hybrid" and getattr(model, "hybrid_trunk", None) is not None:
+            ht = model.hybrid_trunk
+            payload["nhead"] = ht.nhead
+            payload["dim_feedforward"] = ht.dim_feedforward
+            payload["stem_res_blocks"] = args.stem_res_blocks
         torch.save(payload, ckpt_dir / "last.pt")
         if improved:
             torch.save(payload, ckpt_dir / "best.pt")
