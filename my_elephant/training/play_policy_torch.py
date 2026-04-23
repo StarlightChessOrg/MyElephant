@@ -1,6 +1,7 @@
 """
 Tkinter 图形对弈：圆形棋子、鼠标走子、对手上一手箭头提示；
 红/黑可分别选「人类」「纯网络」「MCTS+策略价值网络」。
+纯网络默认在根节点做 1 层 prior+价值搜索（见 ``infer_1ply_value_prior_move``），可用 ``--neural-mode greedy`` 恢复旧贪心。
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from my_elephant.training.policy_torch import (
     count_transformer_encoder_layers_in_state,
     default_transformer_nhead,
     eval_policy_value_at_root,
+    infer_1ply_value_prior_move,
     infer_greedy_move_string,
     torch_load_checkpoint,
 )
@@ -87,6 +89,10 @@ class XiangqiTkApp:
         flist: dict[str, list[str]],
         mcts_sims: int,
         c_puct: float,
+        *,
+        neural_mode: str = "1ply",
+        neural_prior_weight: float = 1.0,
+        neural_value_weight: float = 1.0,
     ) -> None:
         self.master = master
         self.model = model
@@ -94,6 +100,9 @@ class XiangqiTkApp:
         self.flist = flist
         self.mcts_sims = mcts_sims
         self.c_puct = c_puct
+        self.neural_mode = neural_mode
+        self.neural_prior_weight = neural_prior_weight
+        self.neural_value_weight = neural_value_weight
         self.game = GamePlay()
         self.sel_from: tuple[int, int] | None = None
         self.last_move: tuple[int, int, int, int] | None = None
@@ -337,7 +346,17 @@ class XiangqiTkApp:
             try:
                 g = copy_gameplay(self.game)
                 if s == STRATEGY_NEURAL:
-                    mv = _neural_pick_move(g, self.model, self.device, self.flist)
+                    if self.neural_mode == "greedy":
+                        mv = _neural_pick_move(g, self.model, self.device, self.flist)
+                    else:
+                        mv = infer_1ply_value_prior_move(
+                            g,
+                            self.model,
+                            self.device,
+                            self.flist,
+                            prior_weight=self.neural_prior_weight,
+                            value_weight=self.neural_value_weight,
+                        )
                 else:
 
                     def ev(gp: GamePlay):
@@ -383,6 +402,25 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--in-channels", type=int, default=None)
     p.add_argument("--mcts-sims", type=int, default=320, help="MCTS 模拟次数")
     p.add_argument("--c-puct", type=float, default=1.5, help="PUCT 探索系数")
+    p.add_argument(
+        "--neural-mode",
+        type=str,
+        default="1ply",
+        choices=("1ply", "greedy"),
+        help="纯网络：1ply=根枚举 + prior 与后继价值头单层打分；greedy=原两阶段 argmax",
+    )
+    p.add_argument(
+        "--neural-prior-weight",
+        type=float,
+        default=1.0,
+        help="纯网络 1ply：log prior 项系数",
+    )
+    p.add_argument(
+        "--neural-value-weight",
+        type=float,
+        default=1.0,
+        help="纯网络 1ply：-V(后继) 项系数",
+    )
     return p.parse_args()
 
 
@@ -451,7 +489,17 @@ def main() -> None:
     }
 
     root = tk.Tk()
-    app = XiangqiTkApp(root, model, device, flist, mcts_sims=args.mcts_sims, c_puct=args.c_puct)
+    app = XiangqiTkApp(
+        root,
+        model,
+        device,
+        flist,
+        mcts_sims=args.mcts_sims,
+        c_puct=args.c_puct,
+        neural_mode=args.neural_mode,
+        neural_prior_weight=args.neural_prior_weight,
+        neural_value_weight=args.neural_value_weight,
+    )
     root.after(200, app._maybe_schedule_ai)
     root.mainloop()
 

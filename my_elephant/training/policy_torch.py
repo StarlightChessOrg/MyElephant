@@ -1,6 +1,7 @@
 """PyTorch 两阶段策略（起点格 + 落点格）+ 红方胜负和价值头。"""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -490,6 +491,97 @@ def eval_policy_value_at_root(
     red = gameplay.get_side() == "red"
     v = v_red if red else -v_red
     return legals_s, pri_arr, v
+
+
+@torch.no_grad()
+def eval_value_side_to_move(
+    gameplay: GamePlay,
+    model: SuccessorPolicy,
+    device: torch.device,
+    flist: dict[str, list[str]],
+) -> float:
+    """轮到方视角的价值标量（约 ``[-1,1]``）：无着时将死为 ``-1``、否则和 ``0``；否则为价值头经视角换算。"""
+    if not gameplay.legal_moves_iccs():
+        from my_elephant.chess.board_utils import chess_board_from_base
+
+        cb = chess_board_from_base(gameplay.bb)
+        if cb.is_checkmate():
+            return -1.0
+        return 0.0
+    x_cur = _encode_gameplay_current_nchw(gameplay, flist, device)
+    model.eval()
+    feat = model._trunk_flat(x_cur)
+    logits_v = model.value_head(feat)[0]
+    pv = torch.softmax(logits_v.float(), dim=0)
+    v_red = float((pv[0] - pv[2]).item())
+    red = gameplay.get_side() == "red"
+    return float(v_red if red else -v_red)
+
+
+@torch.no_grad()
+def infer_1ply_value_prior_move(
+    gameplay: GamePlay,
+    model: SuccessorPolicy,
+    device: torch.device,
+    flist: dict[str, list[str]],
+    *,
+    prior_weight: float = 1.0,
+    value_weight: float = 1.0,
+    prior_eps: float = 1e-8,
+) -> str:
+    """
+    根节点单层搜索：枚举全部合法着，用 ``eval_policy_value_at_root`` 的 prior ``P(a)``，
+    对每个后继局面 ``s'`` 用价值头得到轮到方 ``V(s')``，走子方打分
+    ``prior_weight * log(P(a)+eps) + value_weight * (-V(s'))``（零和近似），取 argmax。
+    """
+    from my_elephant.chess.board_utils import chess_board_from_base
+    from my_elephant.training.mcts_engine import copy_gameplay
+
+    legals_s, pri_arr, _ = eval_policy_value_at_root(gameplay, model, device, flist)
+    if not legals_s:
+        raise RuntimeError("无合法着法")
+    n = len(legals_s)
+    pri_use = np.asarray(pri_arr, dtype=np.float64).copy()
+    if float(pri_use.sum()) <= 0.0:
+        pri_use.fill(1.0 / n)
+
+    q_root = np.zeros(n, dtype=np.float64)
+    batch_gps: list[GamePlay] = []
+    batch_orig: list[int] = []
+
+    for i, m in enumerate(legals_s):
+        g2 = copy_gameplay(gameplay)
+        g2.make_move(m)
+        if not g2.legal_moves_iccs():
+            cb = chess_board_from_base(g2.bb)
+            v_stm = -1.0 if cb.is_checkmate() else 0.0
+            q_root[i] = -float(v_stm)
+        else:
+            batch_orig.append(i)
+            batch_gps.append(g2)
+
+    if batch_gps:
+        xb = torch.cat(
+            [_encode_gameplay_current_nchw(g, flist, device) for g in batch_gps],
+            dim=0,
+        )
+        model.eval()
+        feat_b = model._trunk_flat(xb)
+        logits_v = model.value_head(feat_b)
+        pv = torch.softmax(logits_v.float(), dim=1)
+        v_red = pv[:, 0] - pv[:, 2]
+        for j, orig_i in enumerate(batch_orig):
+            red = batch_gps[j].get_side() == "red"
+            v_stm = float(v_red[j].item()) if red else float(-v_red[j].item())
+            q_root[orig_i] = -v_stm
+
+    best_i = 0
+    best_sc = -1e18
+    for i in range(n):
+        sc = prior_weight * math.log(pri_use[i] + prior_eps) + value_weight * float(q_root[i])
+        if sc > best_sc:
+            best_sc, best_i = sc, i
+    return legals_s[best_i]
 
 
 def torch_load_checkpoint(path: str | Path, map_location: torch.device | str) -> dict:
