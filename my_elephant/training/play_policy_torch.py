@@ -17,7 +17,7 @@ import torch
 from my_elephant.chess import FEATURE_LIST, GamePlay
 from my_elephant.chess.features import parse_move_squares
 from my_elephant.chess.rationale import POLICY_SELECT_IN_CHANNELS
-from my_elephant.training.mcts_engine import copy_gameplay, mcts_search
+from my_elephant.training.mcts_engine import MCTSSearchStats, copy_gameplay, mcts_search
 from my_elephant.training.policy_torch import (
     SuccessorPolicy,
     count_hybrid_stem_res_blocks_in_state,
@@ -89,6 +89,7 @@ class XiangqiTkApp:
         flist: dict[str, list[str]],
         mcts_sims: int,
         c_puct: float,
+        mcts_max_seconds: float | None = None,
         *,
         neural_mode: str = "1ply",
         neural_prior_weight: float = 1.0,
@@ -100,6 +101,7 @@ class XiangqiTkApp:
         self.flist = flist
         self.mcts_sims = mcts_sims
         self.c_puct = c_puct
+        self.mcts_max_seconds = mcts_max_seconds
         self.neural_mode = neural_mode
         self.neural_prior_weight = neural_prior_weight
         self.neural_value_weight = neural_value_weight
@@ -107,16 +109,16 @@ class XiangqiTkApp:
         self.sel_from: tuple[int, int] | None = None
         self.last_move: tuple[int, int, int, int] | None = None
         self._ai_busy = False
+        self._last_mcts_info: str | None = None
 
         master.title("MyElephant 象棋对弈")
         self.CELL = 52
         self.OFF = 36
-        # 棋子圆半径 r = CELL//2 - 4；最底行中心 y = OFF + 9*CELL + CELL/2，最右列 x = OFF + 8*CELL + CELL/2，
-        # 外接圆会超出原先 OFF*2 + 8/9*CELL 的估算，导致底边（及窄屏时右边）被裁切。
+        # 交点坐标系：棋子落在 (OFF+ix*CELL, OFF+iy*CELL)，最外交点为 (8,9)，圆半径需留边。
         _r = self.CELL // 2 - 4
         _pad = 6
-        self.CW = int(self.OFF * 2 + 8 * self.CELL + self.CELL // 2 + _r + _pad)
-        self.CH = int(self.OFF * 2 + 9 * self.CELL + self.CELL // 2 + _r + _pad)
+        self.CW = int(self.OFF * 2 + 8 * self.CELL + _r + _pad)
+        self.CH = int(self.OFF * 2 + 9 * self.CELL + _r + _pad)
 
         main = ttk.Frame(master, padding=6)
         main.pack(fill=tk.BOTH, expand=True)
@@ -150,9 +152,9 @@ class XiangqiTkApp:
         self._refresh_board()
 
     def _iccs_center(self, ix: int, iy: int) -> tuple[float, float]:
-        h = self.CELL / 2.0
-        cx = self.OFF + ix * self.CELL + h
-        cy = self.OFF + iy * self.CELL + h
+        """ICCS 交叉点 (ix,iy) 的像素坐标（棋子中心落在纵线与横线交点上，非方格中心）。"""
+        cx = float(self.OFF + ix * self.CELL)
+        cy = float(self.OFF + iy * self.CELL)
         return cx, cy
 
     def _draw_traverse_mark(self, cx: float, cy: float) -> None:
@@ -208,7 +210,7 @@ class XiangqiTkApp:
         for ix in (0, 2, 4, 6, 8):
             self._draw_traverse_mark(*self._iccs_center(ix, 6))
 
-        ry = o + 4 * u + u // 2
+        ry = o + 4.5 * u
         font = ("Microsoft YaHei", 13, "bold")
         c.create_text(o + 2 * u, ry, text="楚 河", fill="#5d4037", font=font, tags=t)
         c.create_text(o + 6 * u, ry, text="漢 界", fill="#5d4037", font=font, tags=t)
@@ -255,17 +257,21 @@ class XiangqiTkApp:
         if self.sel_from is not None:
             sx, sy = self.sel_from
             cx, cy = self._iccs_center(sx, sy)
-            d = self.CELL // 2 - 2
+            d = max(self.CELL // 3, r + 2)
             self.canvas.create_rectangle(
                 cx - d, cy - d, cx + d, cy + d, outline="#ffeb3b", width=3, tags="selhi"
             )
 
         side = "红方" if self.game.get_side() == "red" else "黑方"
-        self.status.config(text=f"轮到 {side} 走棋")
+        extra = f" | {self._last_mcts_info}" if self._last_mcts_info else ""
+        self.status.config(text=f"轮到 {side} 走棋{extra}")
 
     def _pixel_to_iccs(self, px: float, py: float) -> tuple[int, int] | None:
-        ix = int((px - self.OFF) // self.CELL)
-        iy = int((py - self.OFF) // self.CELL)
+        """点击映射到最近的交叉点（与棋子落点一致）。"""
+        fx = (px - self.OFF) / self.CELL
+        fy = (py - self.OFF) / self.CELL
+        ix = int(round(fx))
+        iy = int(round(fy))
         if 0 <= ix <= 8 and 0 <= iy <= 9:
             return ix, iy
         return None
@@ -343,6 +349,7 @@ class XiangqiTkApp:
         self.status.config(text="AI 思考中…")
 
         def worker() -> None:
+            mcts_st: MCTSSearchStats | None = None
             try:
                 g = copy_gameplay(self.game)
                 if s == STRATEGY_NEURAL:
@@ -362,12 +369,21 @@ class XiangqiTkApp:
                     def ev(gp: GamePlay):
                         return eval_policy_value_at_root(gp, self.model, self.device, self.flist)
 
-                    mv = mcts_search(g, ev, n_simulations=self.mcts_sims, c_puct=self.c_puct)
+                    mv, mcts_st = mcts_search(
+                        g,
+                        ev,
+                        n_simulations=self.mcts_sims,
+                        c_puct=self.c_puct,
+                        max_seconds=self.mcts_max_seconds,
+                    )
             except Exception as e:
                 err = str(e)
                 self.master.after(0, lambda err=err: self._ai_done_error(err))
                 return
-            self.master.after(0, lambda m=mv: self._ai_done_move(m))
+            if mcts_st is not None:
+                self.master.after(0, lambda m=mv, st=mcts_st: self._ai_done_move(m, st))
+            else:
+                self.master.after(0, lambda m=mv: self._ai_done_move(m))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -377,8 +393,20 @@ class XiangqiTkApp:
         messagebox.showerror("AI 错误", msg)
         self._refresh_board()
 
-    def _ai_done_move(self, mv: str) -> None:
+    def _ai_done_move(self, mv: str, mcts_st: MCTSSearchStats | None = None) -> None:
         self._ai_busy = False
+        if mcts_st is not None:
+            tlim = (
+                f"{mcts_st.requested_max_seconds:.2f}s"
+                if mcts_st.requested_max_seconds is not None
+                else "—"
+            )
+            self._last_mcts_info = (
+                f"MCTS 玩法{mcts_st.n_playouts}/{mcts_st.requested_simulations} "
+                f"墙钟{mcts_st.elapsed_seconds:.3f}s 时限{tlim} "
+                f"网络展开{mcts_st.n_expansions} 根访问{mcts_st.root_total_visits} "
+                f"停止={mcts_st.stopped_by}"
+            )
         if mv not in self._legal_strings():
             self._refresh_board()
             messagebox.showerror("AI", f"非法着法: {mv}")
@@ -391,6 +419,7 @@ class XiangqiTkApp:
         self.game = GamePlay()
         self.sel_from = None
         self.last_move = None
+        self._last_mcts_info = None
         self._refresh_board()
         self._maybe_schedule_ai()
 
@@ -400,7 +429,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--gpu", type=int, default=0, help="-1 为 CPU")
     p.add_argument("--in-channels", type=int, default=None)
-    p.add_argument("--mcts-sims", type=int, default=320, help="MCTS 模拟次数")
+    p.add_argument("--mcts-sims", type=int, default=320, help="MCTS 模拟次数上限")
+    p.add_argument(
+        "--mcts-max-seconds",
+        type=float,
+        default=None,
+        help="MCTS 墙钟时间上限（秒）；与 --mcts-sims 先到先停；不设则仅按模拟次数",
+    )
     p.add_argument("--c-puct", type=float, default=1.5, help="PUCT 探索系数")
     p.add_argument(
         "--neural-mode",
@@ -496,6 +531,7 @@ def main() -> None:
         flist,
         mcts_sims=args.mcts_sims,
         c_puct=args.c_puct,
+        mcts_max_seconds=args.mcts_max_seconds,
         neural_mode=args.neural_mode,
         neural_prior_weight=args.neural_prior_weight,
         neural_value_weight=args.neural_value_weight,

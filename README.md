@@ -107,7 +107,7 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 python -m my_elephant.training.play_policy_torch --checkpoint models/my_run/best.pt
 ```
 
-常用参数：`--gpu`、**`--mcts-sims`**（MCTS 模拟次数，默认 `320`）、**`--c-puct`**（PUCT 系数，默认 `1.5`）。
+常用参数：`--gpu`、**`--mcts-sims`**（MCTS 模拟次数上限，默认 `320`）、**`--mcts-max-seconds`**（墙钟秒数上限，与模拟次数先到先停；不设则仅按次数）、**`--c-puct`**（PUCT 系数，默认 `1.5`）。对弈界面在 MCTS 落子后会在状态栏附带上一轮统计（玩法数、耗时、网络展开次数、根访问合计、停止原因）。
 
 或：`my-play-policy --checkpoint ...`。
 

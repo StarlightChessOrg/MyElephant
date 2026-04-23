@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -26,6 +28,26 @@ def _terminal_outcome(gp: GamePlay) -> float | None:
     if cb.is_checkmate():
         return -1.0
     return 0.0
+
+
+@dataclass(frozen=True)
+class MCTSSearchStats:
+    """
+    一次 MCTS 结束后的简要统计（便于 UI / 日志）。
+
+    ``stopped_by``：``"simulations"`` 表示因达到 ``n_simulations`` 退出循环；``"time"`` 表示因时间上限退出。
+    ``n_expansions``：调用 ``evaluator``（网络展开叶子）的次数。
+    ``root_total_visits``：根各着法访问计数之和（与 ``n_playouts`` 在根处通常接近）。
+    """
+
+    best_move: str
+    n_playouts: int
+    n_expansions: int
+    root_total_visits: int
+    elapsed_seconds: float
+    stopped_by: str
+    requested_simulations: int
+    requested_max_seconds: float | None
 
 
 class _MCTSNode:
@@ -95,16 +117,28 @@ def mcts_search(
     evaluator: Callable[[GamePlay], tuple[list[str], np.ndarray, float]],
     n_simulations: int = 256,
     c_puct: float = 1.5,
-) -> str:
+    *,
+    max_seconds: float | None = None,
+) -> tuple[str, MCTSSearchStats]:
     """
-    从 ``root_gp`` 当前局面出发做 MCTS，返回根下访问次数最多的走法字符串（如 ``77-47``）。
+    从 ``root_gp`` 当前局面出发做 MCTS，返回 ``(走法, 统计)``。
+    在每条 simulation **开始前**检查时间；``max_seconds`` 为 ``None`` 时不限时。
     ``evaluator(gp)`` 须返回 ``(合法走法 str 列表, prior 向量与列表对齐, 轮到方价值 v)``。
     """
     root = _MCTSNode(copy_gameplay(root_gp))
     if _terminal_outcome(root.gp) is not None:
         raise RuntimeError("根节点已终局")
 
-    for _ in range(n_simulations):
+    t0 = time.perf_counter()
+    n_playouts = 0
+    n_expansions = 0
+    stopped_by = "simulations"
+
+    while n_playouts < n_simulations:
+        if max_seconds is not None and (time.perf_counter() - t0) >= max_seconds:
+            stopped_by = "time"
+            break
+        n_playouts += 1
         node = root
         path: list[tuple[_MCTSNode, str]] = []
         while True:
@@ -114,6 +148,7 @@ def mcts_search(
                 break
             if not node.expanded:
                 v = _expand(node, evaluator)
+                n_expansions += 1
                 _backup(path, v)
                 break
             a = _puct_select(node, c_puct)
@@ -122,4 +157,17 @@ def mcts_search(
 
     if not root.P:
         raise RuntimeError("MCTS 未展开")
-    return max(root.P.keys(), key=lambda m: root.N.get(m, 0))
+    best = max(root.P.keys(), key=lambda m: root.N.get(m, 0))
+    elapsed = time.perf_counter() - t0
+    root_visits = int(sum(root.N.get(m, 0) for m in root.P))
+    stats = MCTSSearchStats(
+        best_move=best,
+        n_playouts=n_playouts,
+        n_expansions=n_expansions,
+        root_total_visits=root_visits,
+        elapsed_seconds=elapsed,
+        stopped_by=stopped_by,
+        requested_simulations=n_simulations,
+        requested_max_seconds=max_seconds,
+    )
+    return best, stats
