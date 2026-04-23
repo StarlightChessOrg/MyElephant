@@ -42,10 +42,10 @@ STRATEGY_MCTS = "MCTS+策略价值网络"
 STRATEGIES = (STRATEGY_HUMAN, STRATEGY_NEURAL, STRATEGY_MCTS)
 # ttk.Combobox 的 width 为字符宽度；略大于最长项以免「MCTS+策略价值网络」被裁切。
 _STRATEGY_COMBO_WIDTH = max(22, max(len(s) for s in STRATEGIES) + 6)
-# 状态栏 wraplength（像素）与固定字符宽度：避免「AI 思考中」短文案时右栏变窄、MCTS 结束后变宽。
-_STATUS_WRAPLENGTH_PX = 280
-# ttk.Label 的 width 为「平均字符」数，略大于 wrap 所需以免高 DPI 下仍抖动。
-_STATUS_LABEL_WIDTH_CHARS = 30
+# 状态栏 wraplength（像素）与固定字符宽度；中文等宽字体下需略大于原 280/30，避免 MCTS 长行右侧裁切。
+_STATUS_WRAPLENGTH_PX = 340
+# ttk.Label 的 width 为「平均字符」数；略宽于最长下拉项，与右栏视觉对齐。
+_STATUS_LABEL_WIDTH_CHARS = max(34, _STRATEGY_COMBO_WIDTH + 2)
 
 # 棋子显示（红大写 / 黑小写 → 同一汉字，靠颜色区分）
 _PIECE_CHAR = {
@@ -143,7 +143,7 @@ class XiangqiTkApp:
         self.canvas.pack()
         self.canvas.bind("<Button-1>", self._on_click)
 
-        right = ttk.Frame(main, padding=(12, 0))
+        right = ttk.Frame(main, padding=(14, 0, 10, 0))
         right.pack(side=tk.LEFT, fill=tk.Y)
 
         ttk.Label(right, text="红方策略").pack(anchor=tk.W)
@@ -464,8 +464,8 @@ class XiangqiTkApp:
             self._last_mcts_info = (
                 f"MCTS 玩法{mcts_st.n_playouts}/{mcts_st.requested_simulations} "
                 f"墙钟{mcts_st.elapsed_seconds:.3f}s 时限{tlim}\n"
-                f"网络展开{mcts_st.n_expansions} 根访问{mcts_st.root_total_visits} "
-                f"停止={mcts_st.stopped_by} "
+                f"网络展开{mcts_st.n_expansions} 根访问{mcts_st.root_total_visits}\n"
+                f"停止={mcts_st.stopped_by}\n"
                 f"并行{mcts_st.parallel_workers}线程 VL={mcts_st.virtual_loss:g}"
             )
         if mv not in self._legal_strings():
