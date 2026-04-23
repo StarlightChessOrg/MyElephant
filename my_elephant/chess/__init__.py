@@ -13,9 +13,17 @@ from my_elephant.chess.rationale import (
     POLICY_MAX_LEGAL_MOVES,
     POLICY_SELECT_IN_CHANNELS,
     RATIONALE_PLANE_COUNT,
+    RED_OUTCOME_DRAW,
+    RED_OUTCOME_LOSS,
+    RED_OUTCOME_WIN,
+    VALUE_LABEL_IGNORE,
 )
 from my_elephant.chess.session import GamePlay, legal_moves_iccs_for_board
-from my_elephant.chess.xml_samples import convert_game, successor_planes_for_legals
+from my_elephant.chess.xml_samples import (
+    convert_game,
+    red_outcome_class_from_head,
+    successor_planes_for_legals,
+)
 
 __all__ = [
     "FEATURE_LIST",
@@ -23,12 +31,17 @@ __all__ = [
     "RATIONALE_PLANE_COUNT",
     "POLICY_SELECT_IN_CHANNELS",
     "POLICY_MAX_LEGAL_MOVES",
+    "RED_OUTCOME_WIN",
+    "RED_OUTCOME_DRAW",
+    "RED_OUTCOME_LOSS",
+    "VALUE_LABEL_IGNORE",
     "encode_picker_planes",
     "encode_signed_seven_planes",
     "encode_model_planes",
     "orient_planes_for_model",
     "parse_move_squares",
     "convert_game",
+    "red_outcome_class_from_head",
     "successor_planes_for_legals",
     "legal_moves_iccs_for_board",
     "GamePlay",

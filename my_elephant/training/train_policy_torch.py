@@ -1,5 +1,6 @@
 """
-使用 PyTorch 训练「合法着法后继局面」打分策略网络：对 logits 做 CE，标签为棋谱着法下标。
+使用 PyTorch 训练「合法着法后继局面」打分策略网络（着法 CE）
+与红方胜/和/负三分类价值头（``Head/RecordResult`` CE，与 ``cchess.reader_xqf`` 编码一致）。
 
 依赖：pip install torch pandas（GPU 需对应 CUDA 版 torch）。
 """
@@ -15,14 +16,20 @@ from torch.optim import SGD
 from torch.utils.tensorboard import SummaryWriter
 
 from my_elephant.datasets import ProgressBar
-from my_elephant.training.policy_data import make_policy_dataloader
-from my_elephant.chess.rationale import POLICY_SELECT_IN_CHANNELS
+from my_elephant.training.policy_data import (
+    discover_cbf_files,
+    make_policy_dataloader,
+    split_paths_train_test,
+)
+from my_elephant.chess.rationale import POLICY_SELECT_IN_CHANNELS, VALUE_LABEL_IGNORE
 from my_elephant.training.policy_torch import (
     SuccessorPolicy,
     accuracy_from_logits_masked,
+    batched_current_nhwc_to_torch,
     batched_successors_nhwc_to_torch,
     logits_as_red_preference,
     torch_load_checkpoint,
+    value_accuracy_ignore,
 )
 
 
@@ -45,7 +52,30 @@ class ExpVal:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="训练象棋策略网络 (PyTorch，合法着法 CE)")
+    p = argparse.ArgumentParser(description="训练象棋策略+价值网络 (PyTorch，着法 CE + 红方结果 CE)")
+    p.add_argument(
+        "--cbf-root",
+        type=Path,
+        default=None,
+        help="若指定则从该目录搜集 .cbf（默认递归子目录），并按 --train-ratio 划分 train/val，不再读取 --train-list/--test-list",
+    )
+    p.add_argument(
+        "--cbf-shallow",
+        action="store_true",
+        help="与 --cbf-root 配合：只搜索根目录一层，不递归子文件夹",
+    )
+    p.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.9,
+        help="仅在使用 --cbf-root 时生效：训练集文件占比 (0,1)",
+    )
+    p.add_argument(
+        "--data-seed",
+        type=int,
+        default=42,
+        help="仅在使用 --cbf-root 时生效：train/test 划分的随机种子",
+    )
     p.add_argument("--train-list", type=Path, default=Path("data/train_list.csv"))
     p.add_argument("--test-list", type=Path, default=Path("data/test_list.csv"))
     p.add_argument("--model-name", type=str, default="policy_resnet_torch")
@@ -96,6 +126,12 @@ def _parse_args() -> argparse.Namespace:
         default=4,
         help="每个 worker 预取的 batch 数（仅 num_workers>0；略增内存换吞吐）",
     )
+    p.add_argument(
+        "--value-loss-weight",
+        type=float,
+        default=0.5,
+        help="红方胜/和/负价值头交叉熵相对策略 CE 的权重（无 RecordResult 标签的样本自动忽略）",
+    )
     return p.parse_args()
 
 
@@ -128,7 +164,13 @@ def main() -> None:
     epoch_begin = 0
     global_step = 0
     if ckpt is not None:
-        model.load_state_dict(ckpt["model"])
+        load_ret = model.load_state_dict(ckpt["model"], strict=False)
+        if load_ret.missing_keys:
+            mk = sorted(load_ret.missing_keys)
+            tail = "..." if len(mk) > 12 else ""
+            print(f"[resume] 未从 checkpoint 加载的键（将用随机初始化）: {mk[:12]}{tail}")
+        if load_ret.unexpected_keys:
+            print(f"[resume] checkpoint 中多余键: {load_ret.unexpected_keys}")
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         epoch_begin = int(ckpt.get("epoch", -1)) + 1
@@ -145,15 +187,27 @@ def main() -> None:
     writer = SummaryWriter(log_dir=str(args.log_dir / f"{args.model_name}_torch"))
 
     pin_mem = device.type == "cuda"
+    if args.cbf_root is not None:
+        all_cbf = discover_cbf_files(args.cbf_root, recursive=not args.cbf_shallow)
+        train_sources, test_sources = split_paths_train_test(
+            all_cbf, args.train_ratio, seed=args.data_seed
+        )
+        print(
+            f"[data] --cbf-root {args.cbf_root.resolve()}: "
+            f"{len(all_cbf)} .cbf -> train {len(train_sources)} / test {len(test_sources)}"
+        )
+    else:
+        train_sources, test_sources = args.train_list, args.test_list
+
     train_loader = make_policy_dataloader(
-        args.train_list,
+        train_sources,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=pin_mem,
         prefetch_factor=args.prefetch_factor,
     )
     test_loader = make_policy_dataloader(
-        args.test_list,
+        test_sources,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=pin_mem,
@@ -173,95 +227,148 @@ def main() -> None:
 
         expacc = ExpVal()
         exploss = ExpVal()
+        expacc_v = ExpVal()
+        exploss_v = ExpVal()
 
         pb = ProgressBar(worksum=args.n_batch * args.batch_size, info=f"epoch {epoch} train")
         pb.startjob()
         for batch_i in range(args.n_batch):
             try:
-                batch_x, batch_mask, batch_y, batch_red = next(train_iter)
+                batch_x, batch_mask, batch_y, batch_red, batch_cur, batch_yv = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                batch_x, batch_mask, batch_y, batch_red = next(train_iter)
+                batch_x, batch_mask, batch_y, batch_red, batch_cur, batch_yv = next(train_iter)
             x = batched_successors_nhwc_to_torch(
                 batch_x, device, pin_memory=pin_mem, non_blocking=pin_mem
+            )
+            x_cur = batched_current_nhwc_to_torch(
+                batch_cur, device, pin_memory=pin_mem, non_blocking=pin_mem
             )
             mask = torch.as_tensor(batch_mask, dtype=torch.bool)
             target = torch.as_tensor(batch_y, dtype=torch.long)
             red_b = torch.as_tensor(batch_red, dtype=torch.bool)
+            target_v = torch.as_tensor(batch_yv, dtype=torch.long)
             if pin_mem:
                 mask = mask.pin_memory()
                 target = target.pin_memory()
                 red_b = red_b.pin_memory()
+                target_v = target_v.pin_memory()
             mask = mask.to(device, non_blocking=pin_mem)
             target = target.to(device, non_blocking=pin_mem)
             red_b = red_b.to(device, non_blocking=pin_mem)
+            target_v = target_v.to(device, non_blocking=pin_mem)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            logits_r = logits_as_red_preference(logits, red_b)
+            logits_p, logits_v = model(x, x_cur)
+            logits_r = logits_as_red_preference(logits_p, red_b)
             logits_r = logits_r.masked_fill(~mask, -1e9)
-            loss = F.cross_entropy(logits_r, target)
+            loss_p = F.cross_entropy(logits_r, target)
+            labeled_v = target_v != VALUE_LABEL_IGNORE
+            if labeled_v.any():
+                loss_v = F.cross_entropy(
+                    logits_v, target_v, ignore_index=VALUE_LABEL_IGNORE
+                )
+            else:
+                loss_v = (logits_v * 0).sum()
+            loss = loss_p + args.value_loss_weight * loss_v
             loss.backward()
             optimizer.step()
 
             with torch.no_grad():
                 acc = accuracy_from_logits_masked(logits_r, target, mask)
+                acc_v = value_accuracy_ignore(logits_v, target_v)
 
             global_step += 1
-            writer.add_scalar("train/loss", float(loss.item()), global_step)
+            writer.add_scalar("train/loss_policy", float(loss_p.item()), global_step)
+            writer.add_scalar("train/loss_value", float(loss_v.item()), global_step)
+            writer.add_scalar("train/loss_total", float(loss.item()), global_step)
             writer.add_scalar("train/acc_move_choice", float(acc.item()), global_step)
+            writer.add_scalar("train/acc_red_outcome", float(acc_v.item()), global_step)
             writer.add_scalar("train/lr", batch_lr, global_step)
 
             expacc.update(float(acc.item()) * 100)
             exploss.update(float(loss.item()))
+            expacc_v.update(float(acc_v.item()) * 100)
+            exploss_v.update(float(loss_v.item()))
             pb.info = (
                 f"EPOCH {epoch} STEP {batch_i} LR {batch_lr} "
-                f"ACC {expacc.getval()}% (move) LOSS {exploss.getval()} "
+                f"ACCmv {expacc.getval()}% ACCout {expacc_v.getval()}% "
+                f"LOSS {exploss.getval()} (v {exploss_v.getval()}) "
             )
             pb.complete(args.batch_size)
         print()
 
         model.eval()
         accs: list[float] = []
+        accs_v: list[float] = []
         losses: list[float] = []
+        losses_p: list[float] = []
+        losses_v: list[float] = []
         pb = ProgressBar(worksum=args.n_batch_test * args.batch_size, info=f"validating epoch {epoch}")
         pb.startjob()
         with torch.no_grad():
             for _ in range(args.n_batch_test):
                 try:
-                    batch_x, batch_mask, batch_y, batch_red = next(test_iter)
+                    batch_x, batch_mask, batch_y, batch_red, batch_cur, batch_yv = next(test_iter)
                 except StopIteration:
                     test_iter = iter(test_loader)
-                    batch_x, batch_mask, batch_y, batch_red = next(test_iter)
+                    batch_x, batch_mask, batch_y, batch_red, batch_cur, batch_yv = next(test_iter)
                 x = batched_successors_nhwc_to_torch(
                     batch_x, device, pin_memory=pin_mem, non_blocking=pin_mem
+                )
+                x_cur = batched_current_nhwc_to_torch(
+                    batch_cur, device, pin_memory=pin_mem, non_blocking=pin_mem
                 )
                 mask = torch.as_tensor(batch_mask, dtype=torch.bool)
                 target = torch.as_tensor(batch_y, dtype=torch.long)
                 red_b = torch.as_tensor(batch_red, dtype=torch.bool)
+                target_v = torch.as_tensor(batch_yv, dtype=torch.long)
                 if pin_mem:
                     mask = mask.pin_memory()
                     target = target.pin_memory()
                     red_b = red_b.pin_memory()
+                    target_v = target_v.pin_memory()
                 mask = mask.to(device, non_blocking=pin_mem)
                 target = target.to(device, non_blocking=pin_mem)
                 red_b = red_b.to(device, non_blocking=pin_mem)
-                logits = model(x)
-                logits_r = logits_as_red_preference(logits, red_b)
+                target_v = target_v.to(device, non_blocking=pin_mem)
+                logits_p, logits_v = model(x, x_cur)
+                logits_r = logits_as_red_preference(logits_p, red_b)
                 logits_m = logits_r.masked_fill(~mask, -1e9)
-                loss = F.cross_entropy(logits_m, target)
+                loss_p = F.cross_entropy(logits_m, target)
+                labeled_v = target_v != VALUE_LABEL_IGNORE
+                if labeled_v.any():
+                    loss_v = F.cross_entropy(
+                        logits_v, target_v, ignore_index=VALUE_LABEL_IGNORE
+                    )
+                else:
+                    loss_v = (logits_v * 0).sum()
+                loss = loss_p + args.value_loss_weight * loss_v
                 acc = accuracy_from_logits_masked(logits_m, target, mask)
+                acc_v = value_accuracy_ignore(logits_v, target_v)
                 accs.append(float(acc.item()))
+                accs_v.append(float(acc_v.item()))
                 losses.append(float(loss.item()))
+                losses_p.append(float(loss_p.item()))
+                losses_v.append(float(loss_v.item()))
                 pb.complete(args.batch_size)
         print(
             "TEST ACC(move)%",
             100.0 * np.average(accs),
-            "LOSS",
+            "ACC(red-out)%",
+            100.0 * np.average(accs_v),
+            "LOSS total",
             np.average(losses),
+            "LOSS pol",
+            np.average(losses_p),
+            "LOSS val",
+            np.average(losses_v),
         )
-        writer.add_scalar("val/loss", float(np.average(losses)), epoch)
+        writer.add_scalar("val/loss_total", float(np.average(losses)), epoch)
+        writer.add_scalar("val/loss_policy", float(np.average(losses_p)), epoch)
+        writer.add_scalar("val/loss_value", float(np.average(losses_v)), epoch)
         writer.add_scalar("val/acc_move_choice", float(np.average(accs)), epoch)
+        writer.add_scalar("val/acc_red_outcome", float(np.average(accs_v)), epoch)
         print()
 
         val_loss = float(np.average(losses))

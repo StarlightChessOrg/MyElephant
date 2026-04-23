@@ -71,7 +71,7 @@ def main() -> None:
         else int(ckpt.get("in_channels", ckpt.get("select_in_channels", POLICY_SELECT_IN_CHANNELS)))
     )
     model = SuccessorPolicy(num_res_layers=num_res, in_channels=in_ch).to(device)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
 
     gameplay = GamePlay()
