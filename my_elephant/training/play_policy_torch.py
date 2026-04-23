@@ -6,9 +6,12 @@ Tkinter 图形对弈：圆形棋子、鼠标走子、对手上一手箭头提示
 from __future__ import annotations
 
 import argparse
+import atexit
+import os
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -121,6 +124,12 @@ class XiangqiTkApp:
         self._ai_busy = False
         self._last_mcts_info: str | None = None
 
+        nw_cap = mcts_workers if mcts_workers is not None else (os.cpu_count() or 1)
+        nw_cap = max(1, min(64, nw_cap))
+        self._mcts_executor: ThreadPoolExecutor | None = None
+        if nw_cap > 1:
+            self._mcts_executor = ThreadPoolExecutor(max_workers=nw_cap, thread_name_prefix="mcts")
+
         master.title("MyElephant 象棋对弈")
         self.CELL = 52
         self.OFF = 36
@@ -170,6 +179,22 @@ class XiangqiTkApp:
 
         self._draw_static_grid()
         self._refresh_board()
+
+        master.protocol("WM_DELETE_WINDOW", self._on_close_window)
+
+    def _shutdown_mcts_executor(self) -> None:
+        """关闭 MCTS 常驻线程池（窗口关闭或进程退出时调用；可重复调用）。"""
+        ex, self._mcts_executor = self._mcts_executor, None
+        if ex is None:
+            return
+        try:
+            ex.shutdown(wait=True, cancel_futures=False)
+        except Exception:
+            pass
+
+    def _on_close_window(self) -> None:
+        self._shutdown_mcts_executor()
+        self.master.destroy()
 
     def _iccs_center(self, ix: int, iy: int) -> tuple[float, float]:
         """ICCS 交叉点 (ix,iy) 的像素坐标（棋子中心落在纵线与横线交点上，非方格中心）。"""
@@ -400,6 +425,7 @@ class XiangqiTkApp:
                         max_seconds=self.mcts_max_seconds,
                         virtual_loss=self.mcts_virtual_loss,
                         n_workers=self.mcts_workers,
+                        thread_pool=self._mcts_executor,
                     )
             except Exception as e:
                 err = str(e)
@@ -453,7 +479,12 @@ class XiangqiTkApp:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Tkinter 图形对弈（策略 / MCTS+策略价值）")
     p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--gpu", type=int, default=0, help="-1 为 CPU")
+    p.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+        help="已忽略：本对弈程序固定使用 CPU 加载权重与推理（小模型避免 GPU 往返开销）",
+    )
     p.add_argument("--in-channels", type=int, default=None)
     p.add_argument(
         "--mcts-sims",
@@ -505,11 +536,8 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     mcts_max_seconds = None if args.mcts_max_seconds is not None and args.mcts_max_seconds <= 0 else float(args.mcts_max_seconds)
-    if args.gpu < 0 or not torch.cuda.is_available():
-        device = torch.device("cpu")
-    else:
-        device = torch.device(f"cuda:{args.gpu}")
-
+    _ = args.gpu  # 保留 CLI 兼容，对弈固定 CPU
+    device = torch.device("cpu")
     ckpt = torch_load_checkpoint(args.checkpoint, device)
     sd = ckpt["model"]
     backbone = str(ckpt.get("backbone", "")).lower()
@@ -582,6 +610,7 @@ def main() -> None:
         neural_prior_weight=args.neural_prior_weight,
         neural_value_weight=args.neural_value_weight,
     )
+    atexit.register(app._shutdown_mcts_executor)
     root.after(200, app._maybe_schedule_ai)
     root.mainloop()
 

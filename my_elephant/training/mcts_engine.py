@@ -1,7 +1,7 @@
 """PUCT 式 MCTS，配合策略（起点/落点）+ 价值网络选着。
 
 并行：默认按 CPU 逻辑核心数启动工作线程，在持锁的快速选路阶段之外并发调用 ``evaluator``（网络前向），
-以缩短墙钟；搜索树仍在单进程内共享（与 CUDA 模型兼容）。真多进程需每进程独立模型与根并行再合并根统计，与本实现不同。
+以缩短墙钟；搜索树在单进程内共享，故使用**线程池**而非多进程树搜索。可传入**常驻** ``thread_pool``（由对弈界面创建、退出时 ``shutdown``），避免每局 MCTS 反复创建执行器。
 
 虚拟损失：沿路径选边时对 ``(parent, action)`` 增加 ``parent.in_flight[action]``；PUCT 中
 ``Q ≈ (W - virtual_loss * inflight) / (N + inflight)``；备份后递减，减轻多线程挤占同一路径。
@@ -272,6 +272,7 @@ def mcts_search(
     max_seconds: float | None = None,
     virtual_loss: float = 3.0,
     n_workers: int | None = None,
+    thread_pool: ThreadPoolExecutor | None = None,
 ) -> tuple[str, MCTSSearchStats]:
     """
     从 ``root_gp`` 当前局面出发做 MCTS，返回 ``(走法, 统计)``。
@@ -279,7 +280,10 @@ def mcts_search(
     ``max_seconds``：每条模拟开始前检查；``None`` 表示不限时。
 
     ``n_workers``：并行工作线程数，默认 ``os.cpu_count()``；为 ``1`` 时用单线程路径。
-    评估器在锁外调用；树更新在锁内。与 CUDA 共用单模型时采用多线程而非多进程。
+    评估器在锁外调用；树更新在锁内。
+
+    ``thread_pool``：若传入已创建的 ``ThreadPoolExecutor``，则复用其工作线程且**不在此函数内关闭**池子；
+    为 ``None`` 时每次搜索临时创建并销毁线程池。
     """
     if _terminal_outcome(copy_gameplay(root_gp)) is not None:
         raise RuntimeError("根节点已终局")
@@ -287,6 +291,9 @@ def mcts_search(
     t0 = time.perf_counter()
     nw = 1 if n_workers is not None and n_workers <= 1 else (n_workers or (os.cpu_count() or 1))
     nw = max(1, min(nw, 64, max(1, n_simulations)))
+    if thread_pool is not None and nw > 1:
+        pool_cap = getattr(thread_pool, "_max_workers", nw)
+        nw = max(1, min(nw, int(pool_cap)))
 
     if nw <= 1:
         root, n_playouts, n_expansions, stopped_by = _mcts_search_sequential(
@@ -318,10 +325,15 @@ def mcts_search(
                     n_simulations,
                 )
 
-        with ThreadPoolExecutor(max_workers=nw) as ex:
-            futures = [ex.submit(worker) for _ in range(nw)]
+        if thread_pool is not None:
+            futures = [thread_pool.submit(worker) for _ in range(nw)]
             for f in as_completed(futures):
                 f.result()
+        else:
+            with ThreadPoolExecutor(max_workers=nw) as ex:
+                futures = [ex.submit(worker) for _ in range(nw)]
+                for f in as_completed(futures):
+                    f.result()
 
         n_playouts = counters["n_completed"]
         n_expansions = counters["n_expansions"]

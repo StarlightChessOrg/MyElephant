@@ -101,13 +101,13 @@ python -m my_elephant.training.train_policy_torch --model-name my_run --continue
 
 ## 对弈（Tkinter）
 
-`play_policy_torch` 为 **图形界面**：圆形棋子、鼠标选子再走子；**箭头**标示上一手起点→终点；红/黑可分别选择 **人类**、**纯网络**、**MCTS+策略价值网络**。MCTS 在后台线程运行，避免卡 UI。
+`play_policy_torch` 为 **图形界面**：圆形棋子、鼠标选子再走子；**箭头**标示上一手起点→终点；红/黑可分别选择 **人类**、**纯网络**、**MCTS+策略价值网络**。MCTS 在后台线程运行，避免卡 UI。**推理固定走 CPU**（小权重避免 GPU 往返）；MCTS 使用**常驻线程池**（按 `--mcts-workers` / CPU 核数创建，退出窗口或进程结束时关闭），避免每步搜索重复创建执行器。
 
 ```bash
 python -m my_elephant.training.play_policy_torch --checkpoint models/my_run/best.pt
 ```
 
-常用参数：`--gpu`、**`--mcts-sims`**（模拟次数上限，默认 `192`）、**`--mcts-max-seconds`**（墙钟秒数上限，**默认 `5`**，与模拟次数先到先停；`<=0` 表示不限时）、**`--mcts-workers`**（并行模拟线程数，默认等于 CPU 逻辑核心数；`1` 为单线程）、**`--mcts-virtual-loss`**（多线程时虚拟损失系数，默认 `3`）、**`--c-puct`**（PUCT 系数，默认 `1.5`）。MCTS 在单进程内用**多线程**并行调用网络（与 CUDA 单模型兼容）；对弈界面在 MCTS 落子后会在状态栏附带上一轮统计。
+常用参数：**`--mcts-sims`**（模拟次数上限，默认 `192`）、**`--mcts-max-seconds`**（墙钟秒数上限，**默认 `5`**，与模拟次数先到先停；`<=0` 表示不限时）、**`--mcts-workers`**（并行模拟线程数，默认等于 CPU 逻辑核心数；`1` 为单线程）、**`--mcts-virtual-loss`**（多线程时虚拟损失系数，默认 `3`）、**`--c-puct`**（PUCT 系数，默认 `1.5`）。**`--gpu`** 已保留占位，对弈端不启用 GPU。MCTS 在单进程内用**多线程**并行在 CPU 上跑网络；对弈界面在 MCTS 落子后会在状态栏附带上一轮统计。
 
 或：`my-play-policy --checkpoint ...`。
 
