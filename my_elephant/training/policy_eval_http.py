@@ -33,6 +33,7 @@ def gameplay_from_fen(fen: str) -> GamePlay:
     o = GamePlay.__new__(GamePlay)
     o.bb = BaseChessBoard(fen)
     o.red = o.bb.move_side is not ChessSide.BLACK
+    o._last_move_iccs = None
     return o
 
 

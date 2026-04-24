@@ -62,11 +62,11 @@ class GamePlay:
     @property
     def last_move_iccs(self) -> str | None:
         """产生当前局面的上一手 ICCS；开局为 ``None``。"""
-        return self._last_move_iccs
+        return getattr(self, "_last_move_iccs", None)
 
     def get_board_arr(self) -> np.ndarray:
         boardarr = self.bb.get_board_arr()
         # 与训练一致：固定红方物理视角 + 理据 + 扩展平面（含上一手）
         return encode_model_planes(
-            boardarr, self.red, self.bb, last_move=self._last_move_iccs
+            boardarr, self.red, self.bb, last_move=getattr(self, "_last_move_iccs", None)
         )

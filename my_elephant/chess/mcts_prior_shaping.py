@@ -19,6 +19,7 @@ def _copy_gp(g: GamePlay) -> GamePlay:
     o = GamePlay.__new__(GamePlay)
     o.bb = g.bb.copy()
     o.red = g.red
+    o._last_move_iccs = getattr(g, "_last_move_iccs", None)
     return o
 
 
