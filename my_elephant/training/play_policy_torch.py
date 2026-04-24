@@ -217,6 +217,19 @@ class XiangqiPlaySession:
         with self._lock:
             return self._snapshot_unlocked()
 
+    def _visual_sig_unlocked(self) -> str:
+        """盘面/选中/上一手/策略/行棋方/AI 忙标志的紧凑签名；不变则前端可跳过格子 DOM 重建。"""
+        arr = self._raw_board()
+        cells = "".join((str(arr[iy, ix]) if arr[iy, ix] else ".") for iy in range(10) for ix in range(9))
+        sf = self.sel_from
+        lm = self.last_move
+        sel_s = f"{sf[0]},{sf[1]}" if sf else "-"
+        lm_s = f"{lm[0]},{lm[1]},{lm[2]},{lm[3]}" if lm else "-"
+        return (
+            f"{cells}|{sel_s}|{lm_s}|{self.strategy_red}|{self.strategy_black}|"
+            f"{self.game.get_side()}|{int(self._ai_busy)}"
+        )
+
     def _snapshot_unlocked(self) -> dict:
         arr = self._raw_board()
         rows: list[list[dict[str, str | None]]] = []
@@ -234,6 +247,7 @@ class XiangqiPlaySession:
         status_text = head if not self._last_mcts_info else f"{head}\n{self._last_mcts_info}"
         return {
             "board": rows,
+            "visual_sig": self._visual_sig_unlocked(),
             "side_to_move": self.game.get_side(),
             "sel_from": list(self.sel_from) if self.sel_from else None,
             "last_move": list(self.last_move) if self.last_move else None,
@@ -504,177 +518,334 @@ def _html_page() -> str:
   <title>MyElephant 象棋对弈</title>
   <style>
     :root {
-      --bg: #2c2416;
-      --panel: #3e3426;
-      --line: #4a3225;
-      --cell: #e8d4b8;
+      --bg0: #1a1510;
+      --bg1: #2d2419;
+      --panel: #352a22;
+      --panel2: #2a2218;
+      --line: rgba(74, 50, 37, 0.45);
+      --board-bg0: #f2e8d4;
+      --board-bg1: #e5d3b6;
       --red: #c62828;
       --black: #1565c0;
-      --text: #efe7dc;
+      --text: #f2ebe3;
+      --muted: rgba(242, 235, 227, 0.72);
       --accent: #ff9800;
       --sel: #ffeb3b;
+      --radius: 14px;
     }
     * { box-sizing: border-box; }
     body {
-      margin: 0; font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-      background: var(--bg); color: var(--text); min-height: 100vh;
-      display: flex; flex-wrap: wrap; gap: 16px; padding: 16px; justify-content: center;
+      margin: 0;
+      font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+      color: var(--text);
+      min-height: 100vh;
+      background: radial-gradient(120% 80% at 50% 0%, var(--bg1) 0%, var(--bg0) 55%, #120e0a 100%);
+    }
+    .shell {
+      max-width: 1320px;
+      margin: 0 auto;
+      min-height: 100vh;
+      padding: clamp(14px, 2.2vw, 28px);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+      gap: clamp(16px, 2.5vw, 32px);
+      align-items: center;
+    }
+    @media (max-width: 860px) {
+      .shell {
+        grid-template-columns: 1fr;
+        align-items: start;
+      }
     }
     .board-wrap {
-      background: var(--cell); border-radius: 8px; padding: 12px;
-      box-shadow: 0 8px 24px rgba(0,0,0,.45);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    .board-card {
+      background: linear-gradient(145deg, #faf3e6 0%, var(--board-bg1) 100%);
+      border-radius: var(--radius);
+      padding: clamp(10px, 1.4vw, 16px);
+      box-shadow:
+        0 4px 0 rgba(62, 39, 35, 0.35),
+        0 18px 48px rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(62, 39, 35, 0.25);
     }
     .board {
-      display: grid; grid-template-columns: repeat(9, 44px); grid-template-rows: repeat(10, 44px);
-      position: relative; width: calc(9 * 44px); height: calc(10 * 44px);
-      background: linear-gradient(to bottom, #f0e6d4 0%, #e8d4b8 100%);
+      --cs: clamp(42px, min((100vw - 48px) / 9.6, (100vh - 120px) / 10.2), 76px);
+      display: grid;
+      grid-template-columns: repeat(9, var(--cs));
+      grid-template-rows: repeat(10, var(--cs));
+      width: calc(9 * var(--cs));
+      height: calc(10 * var(--cs));
+      background: linear-gradient(180deg, var(--board-bg0) 0%, var(--board-bg1) 100%);
+      border-radius: 10px;
+      overflow: hidden;
     }
     .cell {
-      border: 1px solid rgba(74,50,37,.25); cursor: pointer; position: relative;
-      display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: bold;
+      border: 1px solid var(--line);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      transition: background 0.08s ease;
     }
-    .cell:hover { background: rgba(255,255,255,.12); }
-    .piece-red { color: #fff; background: var(--red); border-radius: 50%; width: 38px; height: 38px;
-      display: flex; align-items: center; justify-content: center; border: 2px solid #3e2723; }
-    .piece-black { color: #fff; background: var(--black); border-radius: 50%; width: 38px; height: 38px;
-      display: flex; align-items: center; justify-content: center; border: 2px solid #3e2723; }
-    .sel { outline: 3px solid var(--sel); outline-offset: -2px; border-radius: 4px; }
-    .last-from, .last-to { box-shadow: inset 0 0 0 2px var(--accent); }
+    .cell:hover { background: rgba(255, 255, 255, 0.14); }
+    .piece-red, .piece-black {
+      color: #fff;
+      border-radius: 50%;
+      width: calc(var(--cs) * 0.78);
+      height: calc(var(--cs) * 0.78);
+      min-width: 32px;
+      min-height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 2px solid #3e2723;
+      font-size: clamp(15px, calc(var(--cs) * 0.38), 30px);
+      font-weight: 700;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.22);
+    }
+    .piece-red { background: linear-gradient(165deg, #e53935 0%, var(--red) 55%, #8b0000 100%); }
+    .piece-black { background: linear-gradient(165deg, #42a5f5 0%, var(--black) 55%, #0d47a1 100%); }
+    .sel { outline: 3px solid var(--sel); outline-offset: -3px; border-radius: 4px; z-index: 1; }
+    .last-from, .last-to { box-shadow: inset 0 0 0 3px var(--accent); }
     .sidepanel {
-      min-width: 280px; max-width: 380px; background: var(--panel); padding: 16px; border-radius: 8px;
+      background: linear-gradient(180deg, var(--panel) 0%, var(--panel2) 100%);
+      padding: clamp(16px, 2vw, 22px);
+      border-radius: var(--radius);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
     }
-    label { display: block; margin-top: 8px; font-size: 14px; opacity: .9; }
-    select { width: 100%; padding: 8px; margin-top: 4px; border-radius: 6px; border: 1px solid #5d4e3a;
-      background: #2a2218; color: var(--text); font-size: 14px; }
+    h1 {
+      font-size: clamp(1.05rem, 2.2vw, 1.25rem);
+      margin: 0 0 6px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+    }
+    .subtitle { font-size: 12px; color: var(--muted); margin-bottom: 14px; }
+    label { display: block; margin-top: 10px; font-size: 13px; color: var(--muted); }
+    select {
+      width: 100%;
+      padding: 10px 12px;
+      margin-top: 6px;
+      border-radius: 10px;
+      border: 1px solid rgba(93, 78, 58, 0.6);
+      background: rgba(0, 0, 0, 0.25);
+      color: var(--text);
+      font-size: 14px;
+    }
     button {
-      margin-top: 12px; padding: 10px 16px; border: none; border-radius: 6px;
-      background: #6d4c41; color: #fff; font-size: 15px; cursor: pointer; width: 100%;
+      margin-top: 16px;
+      padding: 12px 16px;
+      border: none;
+      border-radius: 10px;
+      background: linear-gradient(180deg, #8d6e63 0%, #6d4c41 100%);
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      width: 100%;
+      box-shadow: 0 2px 0 #4e342e;
     }
-    button:hover { background: #8d6e63; }
+    button:hover { filter: brightness(1.06); }
+    button:active { transform: translateY(1px); }
     #status {
-      margin-top: 14px; white-space: pre-wrap; font-size: 13px; line-height: 1.45;
-      padding: 10px; background: rgba(0,0,0,.2); border-radius: 6px; min-height: 4em;
+      margin-top: 16px;
+      white-space: pre-wrap;
+      font-size: 13px;
+      line-height: 1.5;
+      padding: 12px 14px;
+      background: rgba(0, 0, 0, 0.22);
+      border-radius: 10px;
+      min-height: 4.5em;
+      border: 1px solid rgba(255, 255, 255, 0.05);
     }
-    h1 { font-size: 1.1rem; margin: 0 0 12px; font-weight: 600; }
+    .ai-busy .board { opacity: 0.92; pointer-events: none; }
   </style>
 </head>
 <body>
-  <div class="board-wrap">
-    <div class="board" id="board"></div>
-  </div>
-  <div class="sidepanel">
-    <h1>MyElephant 象棋对弈</h1>
-    <label>红方策略</label>
-    <select id="sel-red"></select>
-    <label>黑方策略</label>
-    <select id="sel-black"></select>
-    <button type="button" id="btn-new">新局</button>
-    <div id="status"></div>
+  <div class="shell" id="shell">
+    <div class="board-wrap">
+      <div class="board-card" id="board-card">
+        <div class="board" id="board" aria-label="棋盘"></div>
+      </div>
+    </div>
+    <div class="sidepanel">
+      <h1>MyElephant 象棋对弈</h1>
+      <div class="subtitle">网页对弈 · 点击格子走子</div>
+      <label>红方策略</label>
+      <select id="sel-red"></select>
+      <label>黑方策略</label>
+      <select id="sel-black"></select>
+      <button type="button" id="btn-new">新局</button>
+      <div id="status"></div>
+    </div>
   </div>
 <script>
 (function () {
+  const shell = document.getElementById("shell");
   const boardEl = document.getElementById("board");
   const statusEl = document.getElementById("status");
   const selRed = document.getElementById("sel-red");
   const selBlack = document.getElementById("sel-black");
   const btnNew = document.getElementById("btn-new");
 
+  let lastVisualSig = null;
+  let pollTimer = null;
+
   function showAlert(title, body) {
     alert(title + "\\n\\n" + body);
   }
 
-  function renderBoard(snap) {
-    boardEl.innerHTML = "";
-    const strategies = snap.strategies || [];
-    if (selRed.options.length === 0) {
-      strategies.forEach(function (t) {
-        const o = document.createElement("option"); o.value = t; o.textContent = t; selRed.appendChild(o);
-      });
-      strategies.forEach(function (t) {
-        const o = document.createElement("option"); o.value = t; o.textContent = t; selBlack.appendChild(o);
-      });
-    }
-    selRed.value = snap.strategy_red;
-    selBlack.value = snap.strategy_black;
-    statusEl.textContent = snap.status_text || "";
+  function fillStrategiesOnce(strategies) {
+    if (selRed.options.length > 0) return;
+    strategies.forEach(function (t) {
+      var o = document.createElement("option");
+      o.value = t;
+      o.textContent = t;
+      selRed.appendChild(o);
+    });
+    strategies.forEach(function (t) {
+      var o = document.createElement("option");
+      o.value = t;
+      o.textContent = t;
+      selBlack.appendChild(o);
+    });
+  }
 
-    const lm = snap.last_move;
-    const sf = snap.sel_from;
-    const busy = !!snap.ai_busy;
-    for (let iy = 0; iy < 10; iy++) {
-      for (let ix = 0; ix < 9; ix++) {
-        const cell = document.createElement("div");
+  function renderCells(snap) {
+    var lm = snap.last_move;
+    var sf = snap.sel_from;
+    var frag = document.createDocumentFragment();
+    for (var iy = 0; iy < 10; iy++) {
+      for (var ix = 0; ix < 9; ix++) {
+        var cell = document.createElement("div");
         cell.className = "cell";
-        cell.dataset.ix = ix; cell.dataset.iy = iy;
+        cell.dataset.ix = String(ix);
+        cell.dataset.iy = String(iy);
         if (lm && ix === lm[0] && iy === lm[1]) cell.classList.add("last-from");
         if (lm && ix === lm[2] && iy === lm[3]) cell.classList.add("last-to");
         if (sf && ix === sf[0] && iy === sf[1]) cell.classList.add("sel");
-        const sq = snap.board[iy][ix];
+        var sq = snap.board[iy][ix];
         if (sq.ch) {
-          const span = document.createElement("span");
+          var span = document.createElement("span");
           span.textContent = sq.label || "?";
           span.className = sq.side === "red" ? "piece-red" : "piece-black";
           cell.appendChild(span);
         }
-        cell.addEventListener("click", function () {
-          if (busy) return;
-          fetch("/api/click", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ ix: ix, iy: iy })
-          }).then(function (r) { return r.json(); }).then(function (j) {
-            if (j.error) showAlert("走子", j.error);
-          }).catch(function () {});
-        });
-        boardEl.appendChild(cell);
+        frag.appendChild(cell);
       }
     }
+    boardEl.replaceChildren(frag);
   }
 
-  function schedulePoll() {
-    fetch("/api/state")
-      .then(function (r) { return r.json(); })
-      .then(function (s) {
-        renderBoard(s);
-        const delay = s.ai_busy ? 400 : 900;
-        return fetch("/api/messages").then(function (r) { return r.json(); }).then(function (msg) {
-          (msg.toasts || []).forEach(function (t) {
-            if (t.kind === "info") showAlert(t.title || "提示", t.body || "");
-          });
-          (msg.ai_errors || []).forEach(function (e) { showAlert("AI 错误", e); });
-          return delay;
-        });
-      })
-      .catch(function () { return 1200; })
-      .then(function (delay) { setTimeout(schedulePoll, delay); });
+  function applySnap(snap) {
+    fillStrategiesOnce(snap.strategies || []);
+    selRed.value = snap.strategy_red;
+    selBlack.value = snap.strategy_black;
+    statusEl.textContent = snap.status_text || "";
+    var sig = snap.visual_sig != null ? snap.visual_sig : JSON.stringify(snap.board);
+    if (sig !== lastVisualSig) {
+      lastVisualSig = sig;
+      renderCells(snap);
+    }
+    shell.classList.toggle("ai-busy", !!snap.ai_busy);
   }
+
+  function handleMessages(msg) {
+    (msg.toasts || []).forEach(function (t) {
+      if (t.kind === "info") showAlert(t.title || "提示", t.body || "");
+    });
+    (msg.ai_errors || []).forEach(function (e) {
+      showAlert("AI 错误", e);
+    });
+  }
+
+  function armPoll(ms) {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(onePoll, ms);
+  }
+
+  function onePoll() {
+    pollTimer = null;
+    Promise.all([
+      fetch("/api/state", { cache: "no-store" }).then(function (r) { return r.json(); }),
+      fetch("/api/messages", { cache: "no-store" }).then(function (r) { return r.json(); })
+    ])
+      .then(function (pair) {
+        var s = pair[0];
+        var msg = pair[1];
+        applySnap(s);
+        handleMessages(msg);
+        var delay = s.ai_busy ? 200 : 520;
+        armPoll(delay);
+      })
+      .catch(function () {
+        armPoll(900);
+      });
+  }
+
+  function kickSoon() {
+    armPoll(35);
+  }
+
+  boardEl.addEventListener("click", function (ev) {
+    var t = ev.target;
+    var cell = t.closest ? t.closest(".cell") : null;
+    if (!cell || shell.classList.contains("ai-busy")) return;
+    var ix = parseInt(cell.dataset.ix, 10);
+    var iy = parseInt(cell.dataset.iy, 10);
+    if (isNaN(ix) || isNaN(iy)) return;
+    fetch("/api/click", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ix: ix, iy: iy })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j.error) showAlert("走子", j.error);
+        else kickSoon();
+      })
+      .catch(function () { kickSoon(); });
+  });
 
   selRed.addEventListener("change", function () {
     fetch("/api/strategies", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ red: selRed.value, black: selBlack.value })
-    }).then(function (r) { return r.json(); }).then(function (j) {
-      if (j.error) showAlert("策略", j.error);
-    });
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j.error) showAlert("策略", j.error);
+        else kickSoon();
+      });
   });
   selBlack.addEventListener("change", function () {
     fetch("/api/strategies", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ red: selRed.value, black: selBlack.value })
-    }).then(function (r) { return r.json(); }).then(function (j) {
-      if (j.error) showAlert("策略", j.error);
-    });
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (j.error) showAlert("策略", j.error);
+        else kickSoon();
+      });
   });
   btnNew.addEventListener("click", function () {
     fetch("/api/new_game", { method: "POST" })
       .then(function (r) { return r.json(); })
-      .then(function (j) { if (j.error) showAlert("新局", j.error); });
+      .then(function (j) {
+        if (j.error) showAlert("新局", j.error);
+        else kickSoon();
+      });
   });
 
-  schedulePoll();
+  onePoll();
 })();
 </script>
 </body>
