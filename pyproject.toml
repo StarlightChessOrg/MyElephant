@@ -16,6 +16,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["ruff>=0.4"]
 training = ["torch>=2.0", "pandas>=1.1", "tensorboard>=2.14"]
+play = ["flask>=2.3"]
 
 [project.scripts]
 my-train-policy = "my_elephant.training.train_policy_torch:main"
