@@ -2,17 +2,18 @@
 使用 PyTorch 训练两阶段策略（起点格 + 落点格 CE）与**行棋方**胜/和/负价值头
 （``Head/RecordResult`` CE，与 ``cchess.reader_xqf`` 编码一致）。主干为 **ResNet 卷积塔**（与 ``StarlightChessOrg/MyElephant`` 提交 ``91e27b25`` 中塔结构一致）+ 当前两阶段策略头与三分类价值头。
 
-依赖：pip install torch pandas（GPU 需对应 CUDA 版 torch）。
+优化器为 **RAdam**（自适应学习率 + 整流预热）；依赖：pip install torch pandas（GPU 需对应 CUDA 版 torch；需 PyTorch≥1.12 含 ``RAdam``）。
 """
 from __future__ import annotations
 
 import argparse
+import inspect
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim import SGD
+from torch.optim import RAdam
 from torch.utils.tensorboard import SummaryWriter
 
 from my_elephant.datasets import ProgressBar
@@ -50,6 +51,23 @@ class ExpVal:
     def getval(self) -> float:
         assert self.val is not None
         return round(self.val, 2)
+
+
+def _build_radam_optimizer(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+) -> RAdam:
+    """构造 RAdam；在支持的 PyTorch 版本上对 weight_decay>0 启用解耦衰减（AdamW 风格）。"""
+    wd = float(args.weight_decay)
+    kw: dict = {
+        "lr": float(args.beginning_lr),
+        "betas": (float(args.beta1), float(args.beta2)),
+        "eps": float(args.eps),
+        "weight_decay": wd,
+    }
+    if wd > 0 and "decoupled_weight_decay" in inspect.signature(RAdam.__init__).parameters:
+        kw["decoupled_weight_decay"] = True
+    return RAdam(model.parameters(), **kw)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -106,12 +124,26 @@ def _parse_args() -> argparse.Namespace:
         "--beginning-lr",
         "--lr",
         type=float,
-        default=0.03,
+        default=1e-3,
         dest="beginning_lr",
         metavar="LR",
-        help="SGD 学习率初值；按 --decay-epoch 分段乘以 0.1",
+        help="RAdam 初始学习率；每经过 --decay-epoch 个 epoch 乘以 --lr-decay-factor",
     )
-    p.add_argument("--decay-epoch", type=int, default=10)
+    p.add_argument(
+        "--decay-epoch",
+        type=int,
+        default=15,
+        help="学习率分段衰减的周期（epoch）；须 >=1",
+    )
+    p.add_argument(
+        "--lr-decay-factor",
+        type=float,
+        default=0.5,
+        help="每个衰减段将当前 lr 乘以此系数（0<系数≤1；1 表示不衰减）",
+    )
+    p.add_argument("--beta1", type=float, default=0.9, help="RAdam β1")
+    p.add_argument("--beta2", type=float, default=0.999, help="RAdam β2")
+    p.add_argument("--eps", type=float, default=1e-8, help="RAdam 数值稳定项 ε")
     p.add_argument("--log-dir", type=Path, default=Path("log"))
     p.add_argument("--model-dir", type=Path, default=Path("models"))
     p.add_argument(
@@ -150,6 +182,18 @@ def _parse_args() -> argparse.Namespace:
         default=0.5,
         help="行棋方胜/和/负价值头交叉熵相对策略 CE 的权重（无 RecordResult 标签的样本自动忽略）",
     )
+    p.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-4,
+        help="RAdam 权重衰减；默认与先前 SGD 量级一致；可试 1e-3～1e-2（若 PyTorch 支持解耦式则自动启用）",
+    )
+    p.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="验证 total loss 连续若干 epoch 未刷新 best 则停止；0 表示关闭（仍保存 best.pt）",
+    )
     return p.parse_args()
 
 
@@ -176,6 +220,10 @@ def _resolve_resume_path(args: argparse.Namespace) -> Path | None:
 
 def main() -> None:
     args = _parse_args()
+    if not (0.0 < float(args.lr_decay_factor) <= 1.0):
+        raise SystemExit("--lr-decay-factor 须在 (0,1] 内")
+    if int(args.decay_epoch) < 1:
+        raise SystemExit("--decay-epoch 须 >= 1")
     if args.num_workers is None:
         args.num_workers = default_num_workers()
     device = _device(args)
@@ -262,10 +310,15 @@ def main() -> None:
     print(
         f"[model] backbone=resnet filters={args.filters} res_blocks={args.num_res_layers} params={nparam:,}"
     )
-    optimizer = SGD(model.parameters(), lr=args.beginning_lr, momentum=0.9)
+    optimizer = _build_radam_optimizer(model, args)
+    print(
+        f"[optim] RAdam lr={args.beginning_lr:g} betas=({args.beta1},{args.beta2}) eps={args.eps:g} "
+        f"weight_decay={args.weight_decay:g} decay_every={args.decay_epoch}epoch×{args.lr_decay_factor:g}"
+    )
 
     epoch_begin = 0
     global_step = 0
+    optimizer_state_loaded = False
     if ckpt is not None:
         load_ret = model.load_state_dict(ckpt["model"], strict=False)
         if load_ret.missing_keys:
@@ -275,9 +328,19 @@ def main() -> None:
         if load_ret.unexpected_keys:
             print(f"[resume] checkpoint 中多余键: {load_ret.unexpected_keys}")
         if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                optimizer_state_loaded = True
+            except (ValueError, RuntimeError) as e:
+                print(f"[resume] 优化器状态与当前 RAdam 不兼容，已跳过加载（将重新累积动量等）: {e}")
         epoch_begin = int(ckpt.get("epoch", -1)) + 1
         global_step = int(ckpt.get("global_step", 0))
+    if epoch_begin > 0 and not optimizer_state_loaded:
+        lr_step = epoch_begin // int(args.decay_epoch)
+        sync_lr = float(args.beginning_lr) * (float(args.lr_decay_factor) ** lr_step)
+        for pg in optimizer.param_groups:
+            pg["lr"] = sync_lr
+        print(f"[resume] 优化器 lr 已按 epoch {epoch_begin} 对齐为 {sync_lr:g}")
 
     best_val_loss = float("inf")
     if ckpt is not None:
@@ -287,6 +350,12 @@ def main() -> None:
         elif isinstance(b, int) and not isinstance(b, bool):
             best_val_loss = float(b)
 
+    epochs_no_improve = 0
+    if ckpt is not None:
+        ei = ckpt.get("epochs_no_improve")
+        if isinstance(ei, int) and not isinstance(ei, bool):
+            epochs_no_improve = int(ei)
+
     writer = SummaryWriter(log_dir=str(args.log_dir / f"{args.model_name}_torch"))
 
     train_iter = iter(train_loader)
@@ -295,7 +364,8 @@ def main() -> None:
     for epoch in range(epoch_begin, args.n_epochs):
         model.train()
         prev_lr = float(optimizer.param_groups[0]["lr"])
-        batch_lr = args.beginning_lr * 10 ** -(epoch // args.decay_epoch)
+        lr_step = epoch // int(args.decay_epoch)
+        batch_lr = float(args.beginning_lr) * (float(args.lr_decay_factor) ** lr_step)
         for pg in optimizer.param_groups:
             pg["lr"] = batch_lr
         if batch_lr < prev_lr - 1e-12:
@@ -457,6 +527,9 @@ def main() -> None:
         improved = val_loss < best_val_loss
         if improved:
             best_val_loss = val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
         payload = {
             "model": model.state_dict(),
@@ -467,13 +540,24 @@ def main() -> None:
             "filters": model.filters,
             "in_channels": model.in_channels,
             "backbone": "resnet",
+            "optim": "radam",
+            "lr_decay_factor": float(args.lr_decay_factor),
+            "decay_epoch": int(args.decay_epoch),
             "val_loss": val_loss,
             "best_val_loss": best_val_loss,
+            "epochs_no_improve": epochs_no_improve,
         }
         torch.save(payload, ckpt_dir / "last.pt")
         if improved:
             torch.save(payload, ckpt_dir / "best.pt")
             print(f"  -> saved best.pt (val_loss={val_loss:.4f})")
+
+        if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
+            print(
+                f"[early-stop] 验证 total loss 已连续 {epochs_no_improve} 个 epoch 未优于 "
+                f"best={best_val_loss:.4f}，停止训练（推理请优先用 best.pt）"
+            )
+            break
 
     writer.close()
 
