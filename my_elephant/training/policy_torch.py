@@ -12,8 +12,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from my_elephant.chess.board_utils import chess_board_from_base
 from my_elephant.chess.features import encode_model_planes
-from my_elephant.chess.rationale import POLICY_GRID_NUMEL, POLICY_SELECT_IN_CHANNELS, VALUE_LABEL_IGNORE
+from my_elephant.chess.rationale import (
+    POLICY_GRID_NUMEL,
+    POLICY_SELECT_IN_CHANNELS,
+    STM_VALUE_EXPECT_DRAW_COEF,
+    STM_VALUE_EXPECT_LOSS_COEF,
+    STM_VALUE_EXPECT_WIN_COEF,
+    STM_VALUE_TERMINAL_DRAW,
+    STM_VALUE_TERMINAL_LOSS,
+    VALUE_LABEL_IGNORE,
+    stm_value_expectation_from_win_draw_loss_probs,
+)
 from my_elephant.chess.session import GamePlay
 
 
@@ -294,7 +305,7 @@ def _root_prior_value_from_hidden_row(
         pri_arr /= s
     logits_v = model.value_head(feat)[0]
     pv = torch.softmax(logits_v.float(), dim=0).cpu().numpy()
-    v = float(pv[0] - pv[2])
+    v = stm_value_expectation_from_win_draw_loss_probs(float(pv[0]), float(pv[1]), float(pv[2]))
     return legals_s, pri_arr, v
 
 
@@ -326,7 +337,10 @@ def batched_eval_policy_value_at_root(
     out: list[tuple[list[str], np.ndarray, float] | None] = [None] * n
     for i in range(n):
         if not legals_per[i]:
-            out[i] = ([], np.zeros(0, dtype=np.float64), 0.0)
+            gp0 = gameplays[i]
+            cb0 = chess_board_from_base(gp0.bb)
+            v0 = float(STM_VALUE_TERMINAL_LOSS) if cb0.is_checkmate() else float(STM_VALUE_TERMINAL_DRAW)
+            out[i] = ([], np.zeros(0, dtype=np.float64), v0)
     if not nonempty:
         return [out[i] for i in range(n)]  # type: ignore[list-item]
     model.eval()
@@ -356,7 +370,7 @@ def eval_policy_value_at_root(
 ) -> tuple[list[str], np.ndarray, float]:
     """
     MCTS 用：对当前局面枚举合法着法，用分解式 ``P(着)=P(起点)P(落点|起点)`` 得到与 ``legals`` 对齐的 prior，
-    并给出轮到方价值标量（由**行棋方**三分类 ``P(胜)-P(负)``，无需再按红黑翻转）。
+    并给出轮到方价值标量（由**行棋方**三分类 ``3*P(胜)+P(和)-3*P(负)``，无需再按红黑翻转）。
     """
     return batched_eval_policy_value_at_root(
         [gameplay], model, device, flist, policy_temperature=policy_temperature
@@ -453,20 +467,22 @@ def eval_value_side_to_move(
     device: torch.device,
     flist: dict[str, list[str]],
 ) -> float:
-    """轮到方视角的价值标量（约 ``[-1,1]``）：无着时将死为 ``-1``、否则和 ``0``；否则为价值头 ``P(行棋方胜)-P(行棋方负)``。"""
+    """轮到方视角的价值标量（约 ``[-3,3]``）：无着时将死为 ``-3``、否则和 ``+1``；否则为价值头 ``3*P(胜)+P(和)-3*P(负)``。"""
     if not gameplay.legal_moves_iccs():
-        from my_elephant.chess.board_utils import chess_board_from_base
-
         cb = chess_board_from_base(gameplay.bb)
         if cb.is_checkmate():
-            return -1.0
-        return 0.0
+            return float(STM_VALUE_TERMINAL_LOSS)
+        return float(STM_VALUE_TERMINAL_DRAW)
     x_cur = _encode_gameplay_current_nchw(gameplay, flist, device)
     model.eval()
     feat = model._trunk_flat(x_cur)
     logits_v = model.value_head(feat)[0]
     pv = torch.softmax(logits_v.float(), dim=0)
-    return float((pv[0] - pv[2]).item())
+    return float(
+        stm_value_expectation_from_win_draw_loss_probs(
+            float(pv[0].item()), float(pv[1].item()), float(pv[2].item())
+        )
+    )
 
 
 @torch.no_grad()
@@ -486,7 +502,6 @@ def infer_1ply_value_prior_move(
     对每个后继局面 ``s'`` 用价值头得到轮到方 ``V(s')``，走子方打分
     ``prior_weight * log(P(a)+eps) + value_weight * (-V(s'))``（零和近似），取 argmax。
     """
-    from my_elephant.chess.board_utils import chess_board_from_base
     from my_elephant.training.mcts_engine import copy_gameplay
 
     legals_s, pri_arr, _ = eval_policy_value_at_root(
@@ -508,7 +523,7 @@ def infer_1ply_value_prior_move(
         g2.make_move(m)
         if not g2.legal_moves_iccs():
             cb = chess_board_from_base(g2.bb)
-            v_stm = -1.0 if cb.is_checkmate() else 0.0
+            v_stm = float(STM_VALUE_TERMINAL_LOSS) if cb.is_checkmate() else float(STM_VALUE_TERMINAL_DRAW)
             q_root[i] = -float(v_stm)
         else:
             batch_orig.append(i)
@@ -523,7 +538,11 @@ def infer_1ply_value_prior_move(
         feat_b = model._trunk_flat(xb)
         logits_v = model.value_head(feat_b)
         pv = torch.softmax(logits_v.float(), dim=1)
-        v_stm_child = pv[:, 0] - pv[:, 2]
+        v_stm_child = (
+            STM_VALUE_EXPECT_WIN_COEF * pv[:, 0]
+            + STM_VALUE_EXPECT_DRAW_COEF * pv[:, 1]
+            - STM_VALUE_EXPECT_LOSS_COEF * pv[:, 2]
+        )
         for j, orig_i in enumerate(batch_orig):
             q_root[orig_i] = -float(v_stm_child[j].item())
 

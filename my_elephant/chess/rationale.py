@@ -51,6 +51,22 @@ STM_OUTCOME_DRAW = 1
 STM_OUTCOME_LOSS = 2
 VALUE_LABEL_IGNORE = -100
 
+# 行棋方价值 softmax 合成标量（与 MCTS 叶子终局刻度一致）：3*P(胜)+P(和)-3*P(负)。
+# 三分类 one-hot 时期望：胜 +3、和 +1、负 -3。
+STM_VALUE_EXPECT_WIN_COEF = 3.0
+STM_VALUE_EXPECT_DRAW_COEF = 1.0
+STM_VALUE_EXPECT_LOSS_COEF = 3.0
+STM_VALUE_TERMINAL_LOSS = -STM_VALUE_EXPECT_LOSS_COEF
+STM_VALUE_TERMINAL_DRAW = STM_VALUE_EXPECT_DRAW_COEF
+
+
+def stm_value_expectation_from_win_draw_loss_probs(p_win: float, p_draw: float, p_loss: float) -> float:
+    return (
+        STM_VALUE_EXPECT_WIN_COEF * p_win
+        + STM_VALUE_EXPECT_DRAW_COEF * p_draw
+        - STM_VALUE_EXPECT_LOSS_COEF * p_loss
+    )
+
 
 def stm_outcome_class_from_red_outcome(red_cls: int, red_to_move: bool) -> int:
     """

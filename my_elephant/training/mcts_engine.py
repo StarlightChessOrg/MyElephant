@@ -22,6 +22,7 @@ import numpy as np
 
 from my_elephant.chess.board_utils import chess_board_from_base
 from my_elephant.chess.mcts_prior_shaping import tactical_boost_priors
+from my_elephant.chess.rationale import STM_VALUE_TERMINAL_DRAW, STM_VALUE_TERMINAL_LOSS
 from my_elephant.chess.session import GamePlay
 
 
@@ -71,13 +72,13 @@ def _reuse_mcts_root_or_fresh(root_gp: GamePlay, reuse: _MCTSNode | None) -> _MC
 
 
 def _terminal_outcome(gp: GamePlay) -> float | None:
-    """若无合法着：将死则轮到方 -1，否则和 0；有合法着返回 None。"""
+    """若无合法着：将死则轮到方 ``STM_VALUE_TERMINAL_LOSS``，否则和 ``STM_VALUE_TERMINAL_DRAW``；有合法着返回 None。"""
     if gp.legal_moves_iccs():
         return None
     cb = chess_board_from_base(gp.bb)
     if cb.is_checkmate():
-        return -1.0
-    return 0.0
+        return float(STM_VALUE_TERMINAL_LOSS)
+    return float(STM_VALUE_TERMINAL_DRAW)
 
 
 @dataclass(frozen=True)
