@@ -454,7 +454,7 @@ def _parse_args() -> argparse.Namespace:
         "--in-channels",
         type=int,
         default=None,
-        help="与 checkpoint stem 一致；默认从 ckpt 读。新模型为 18（7 子力+11 理据），仅 7 通道旧权重请传 7",
+        help="与 checkpoint 中 in_channels 一致；省略时使用 ckpt 元数据或当前默认 encode_model_planes 通道数",
     )
     p.add_argument(
         "--mcts-sims",

@@ -162,7 +162,7 @@ def _parse_args() -> argparse.Namespace:
         "--in-channels",
         type=int,
         default=None,
-        help="输入通道数；默认 18=7 有符号子力+11 理据（与 encode_model_planes 一致）。加载仅 7 通道的旧 checkpoint 时请显式传 --in-channels 7",
+        help=f"输入通道数；默认 {POLICY_SELECT_IN_CHANNELS}（与 encode_model_planes / checkpoint 一致）",
     )
     p.add_argument(
         "--num-workers",
@@ -252,16 +252,11 @@ def main() -> None:
             raise ValueError(
                 "checkpoint 为 transformer 主干，本版本已改为仅 ResNet 塔（见 commit 91e27b25 塔结构 + 两阶段头）；请换用 resnet 权重或使用旧分支。"
             )
-        if args.in_channels is not None:
-            in_ch = int(args.in_channels)
-        elif ckpt.get("in_channels") is not None:
-            in_ch = int(ckpt["in_channels"])
-        elif ckpt.get("select_in_channels") is not None:
-            in_ch = int(ckpt["select_in_channels"])
-        elif isinstance(sd, dict) and "stem_conv.weight" in sd:
-            in_ch = int(sd["stem_conv.weight"].shape[1])
-        else:
-            in_ch = POLICY_SELECT_IN_CHANNELS
+        in_ch = int(
+            args.in_channels
+            if args.in_channels is not None
+            else ckpt.get("in_channels", ckpt.get("select_in_channels", POLICY_SELECT_IN_CHANNELS))
+        )
         if isinstance(sd, dict) and "stem_conv.weight" in sd:
             inferred_f = int(sd["stem_conv.weight"].shape[0])
             if ckpt.get("filters") is not None:

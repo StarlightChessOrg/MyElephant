@@ -8,6 +8,7 @@ from my_elephant.chess.features import (
     orient_planes_for_model,
     parse_move_squares,
 )
+from my_elephant.chess.plane_extras import EXTRA_HINT_PLANE_COUNT, encode_extra_hint_planes
 from my_elephant.chess.rationale import (
     PIECE_PLANE_COUNT,
     POLICY_GRID_NUMEL,
@@ -36,6 +37,8 @@ __all__ = [
     "FEATURE_LIST",
     "PIECE_PLANE_COUNT",
     "RATIONALE_PLANE_COUNT",
+    "EXTRA_HINT_PLANE_COUNT",
+    "encode_extra_hint_planes",
     "POLICY_SELECT_IN_CHANNELS",
     "POLICY_MAX_LEGAL_MOVES",
     "POLICY_GRID_NUMEL",

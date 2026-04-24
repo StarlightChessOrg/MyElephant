@@ -8,6 +8,7 @@ import numpy as np
 
 from cchess.board import BaseChessBoard
 
+from my_elephant.chess.plane_extras import encode_extra_hint_planes
 from my_elephant.chess.rationale import encode_rationale_planes
 
 # 与历史 notebook 中顺序保持一致
@@ -82,18 +83,20 @@ def encode_model_planes(
     red_to_move: bool,
     board_state: BaseChessBoard,
     feature_list: Mapping[str, list[str]] | None = None,
+    *,
+    move_index: int | None = None,
 ) -> np.ndarray:
     """
     策略网络输入（**固定红方物理棋盘**坐标，不按行棋方翻转棋盘）：
 
-    - **7 路** ``encode_signed_seven_planes``：兵种有符号平面；
-    - **11 路** ``encode_rationale_planes``：九宫/半场、**行棋方常数平面**（红 +1 / 黑 −1）、
-      帅将位、被将军、子力价值、双方灵活度与着法质量等。
+    - **7 路** 有符号兵种；**11 路** 理据（九宫、行棋方 ±1、将帅、将军、子力、灵活度等）；
+    - **6 路** ``plane_extras``：格坐标 x/8、y/9；谱面步数归一化；飞将；行棋方与对方**合法着法落点并集**。
 
-    共 **18** 通道，与 ``POLICY_SELECT_IN_CHANNELS`` 一致。``board_state`` 须为走棋前的 ``BaseChessBoard``（含正确 ``move_side``）。
-    ``red_to_move`` / ``feature_list`` 保留以兼容旧调用方；理据通道由 ``board_state`` 推导，调用方宜保持 ``red_to_move`` 与 ``board_state`` 一致。
+    通道数等于 ``POLICY_SELECT_IN_CHANNELS``（当前为 7+11+6）。``move_index`` 为从 0 起的本局步序号（棋谱迭代），推理可省略。
+    ``board_state`` 须含正确 ``move_side``；``red_to_move`` / ``feature_list`` 保留兼容，宜与 ``board_state`` 一致。
     """
     _ = (red_to_move, feature_list)
     pieces = encode_signed_seven_planes(boardarr)
     rationale = encode_rationale_planes(boardarr, board_state)
-    return np.concatenate([pieces, rationale], axis=0)
+    extra = encode_extra_hint_planes(boardarr, board_state, move_index=move_index)
+    return np.concatenate([pieces, rationale, extra], axis=0)

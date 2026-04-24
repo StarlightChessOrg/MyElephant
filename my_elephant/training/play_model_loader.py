@@ -22,13 +22,6 @@ def _infer_filters_from_state(sd: dict) -> int:
     return 256
 
 
-def _infer_in_channels_from_state(sd: dict) -> int | None:
-    w = sd.get("stem_conv.weight")
-    if w is not None and getattr(w, "ndim", 0) == 4:
-        return int(w.shape[1])
-    return None
-
-
 def load_successor_policy_for_play(
     checkpoint: Path,
     device: torch.device,
@@ -49,15 +42,11 @@ def load_successor_policy_for_play(
     num_res = int(ckpt.get("num_res_layers", 0))
     if num_res <= 0:
         num_res = count_resnet_blocks_in_state(sd) or 10
-    if in_channels is not None:
-        in_ch = int(in_channels)
-    elif ckpt.get("in_channels") is not None:
-        in_ch = int(ckpt["in_channels"])
-    elif ckpt.get("select_in_channels") is not None:
-        in_ch = int(ckpt["select_in_channels"])
-    else:
-        inferred = _infer_in_channels_from_state(sd)
-        in_ch = int(inferred if inferred is not None else POLICY_SELECT_IN_CHANNELS)
+    in_ch = int(
+        in_channels
+        if in_channels is not None
+        else ckpt.get("in_channels", ckpt.get("select_in_channels", POLICY_SELECT_IN_CHANNELS))
+    )
     model = SuccessorPolicy(
         num_res_layers=num_res,
         in_channels=in_ch,

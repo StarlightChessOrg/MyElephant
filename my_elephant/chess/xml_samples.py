@@ -151,11 +151,11 @@ def convert_game(
     ]
 
     bb = BaseChessBoard(fen)
-    for mv in moves:
+    for move_index, mv in enumerate(moves):
         red_to_move = bb.move_side is not ChessSide.BLACK
         boardarr_before = bb.get_board_arr()
         current_chw = encode_model_planes(
-            boardarr_before, red_to_move, bb, feature_list
+            boardarr_before, red_to_move, bb, feature_list, move_index=move_index
         ).astype(np.float32, copy=False)
         x1, y1, x2, y2 = parse_move_squares(mv)
         legals = sorted(legal_moves_iccs_for_board(bb))

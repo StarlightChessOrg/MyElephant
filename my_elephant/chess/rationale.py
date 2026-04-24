@@ -2,13 +2,11 @@
 在棋子平面之外，补充与「棋规 / 地理 / 将帅安危 / 子力与灵活度」相关的输入通道，
 让网络更容易接触「为何要走」的结构化线索（仍需训练目标配合，并非单靠特征即可学理）。
 
-11 个附加平面（`encode_rationale_planes` 堆叠顺序），与 7 路有符号子力平面拼接为策略网络输入：
-  1–3. 红九宫、黑九宫、黑方半场掩码
-  4. 行棋方：全图 +1（红走）或 −1（黑走）
-  5–6. 帅位、将位
-  7. 行棋方被将军（整盘同值）
-  8. 带符号子力价值（行棋方视角）
-  9–11. 行棋方 / 对方灵活度、行棋方着法质量灵活度
+11 个理据平面（`encode_rationale_planes` 堆叠顺序），与 7 路有符号子力、``plane_extras`` 几何/步序/飞将/着法并集
+一起在 ``encode_model_planes`` 中拼接（总通道见 ``POLICY_SELECT_IN_CHANNELS``）：
+
+  1–3. 红九宫、黑九宫、黑方半场掩码；4. 行棋方 ±1；5–6. 帅位、将位；
+  7. 被将军；8. 子力价值；9–11. 双方灵活度与行棋方着法质量。
 """
 from __future__ import annotations
 
@@ -18,6 +16,7 @@ from cchess.board import BaseChessBoard, ChessBoard
 from cchess.piece import ChessSide, PieceT, fench_to_species
 
 from my_elephant.chess.board_utils import chess_board_from_base
+from my_elephant.chess.plane_extras import EXTRA_HINT_PLANE_COUNT
 
 # 近似子力价值（车=9 量纲），将帅不参与数值以免干扰「净多子」感知
 PIECE_VALUE_BY_FENCH: dict[str, float] = {
@@ -32,11 +31,12 @@ PIECE_VALUE_BY_FENCH: dict[str, float] = {
 
 # 旧版 14 路己方/对方二值平面（encode_picker_planes）；分析脚本仍可参考
 PIECE_PLANE_COUNT = 14
-# encode_rationale_planes 的附加通道数（与 7 路子力平面在 encode_model_planes 中拼接）
+# encode_rationale_planes 的附加通道数（与 7 路子力、plane_extras 在 encode_model_planes 中拼接）
 RATIONALE_PLANE_COUNT = 11
-# 策略网络输入：7 路有符号兵种 + 11 路理据平面，见 features.encode_model_planes
 PIECE_SIGNED_PLANE_COUNT = 7
-POLICY_SELECT_IN_CHANNELS = PIECE_SIGNED_PLANE_COUNT + RATIONALE_PLANE_COUNT
+
+# 策略网络输入通道总数（见 features.encode_model_planes）
+POLICY_SELECT_IN_CHANNELS = PIECE_SIGNED_PLANE_COUNT + RATIONALE_PLANE_COUNT + EXTRA_HINT_PLANE_COUNT
 # 训练批填充：合法着法数上界（一般远小于此；若棋谱超出需调大）
 POLICY_MAX_LEGAL_MOVES = 96
 # 策略「先起点后落点」：ICCS 9×10 展平为 90 格（下标 y*9+x）
