@@ -91,7 +91,7 @@ def encode_model_planes(
     策略网络输入（**固定红方物理棋盘**坐标，不按行棋方翻转棋盘）：
 
     - **7 路** 有符号兵种；**11 路** 理据；**``EXTRA_HINT_PLANE_COUNT`` 路** ``plane_extras``
-      （坐标、步序、飞将、着法并集、上一手、子力与将帅几何、吃子目标、兵纵深、双方车马炮控制等）。
+      （坐标/步序/飞将/着法并集/上一手/子力与将几何/吃子与兵种控制/河界与半场/将邻与象士/兵吃与将射线/双方各兵种数量广播等，见 ``plane_extras.encode_extra_hint_planes`` 文档串）。
 
     总通道 ``POLICY_SELECT_IN_CHANNELS`` = 7 + 11 + ``EXTRA_HINT_PLANE_COUNT``。``last_move`` 为产生当前局面的上一手 ICCS 串（如 ``77-67``），无则 ``None``。
     """
