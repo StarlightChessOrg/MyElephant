@@ -3,7 +3,7 @@
 让网络更容易接触「为何要走」的结构化线索（仍需训练目标配合，并非单靠特征即可学理）。
 
 11 个理据平面（`encode_rationale_planes` 堆叠顺序），与 7 路有符号子力、``plane_extras`` 几何/步序/飞将/着法并集
-一起在 ``encode_model_planes`` 中拼接（总通道见 ``POLICY_SELECT_IN_CHANNELS``）：
+一起在 ``encode_model_planes`` 中拼接；总通道 ``POLICY_SELECT_IN_CHANNELS`` = 7 + 11 + ``EXTRA_HINT_PLANE_COUNT``（见 ``plane_extras``）：
 
   1–3. 红九宫、黑九宫、黑方半场掩码；4. 行棋方 ±1；5–6. 帅位、将位；
   7. 被将军；8. 子力价值；9–11. 双方灵活度与行棋方着法质量。

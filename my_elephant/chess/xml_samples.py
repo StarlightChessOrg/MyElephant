@@ -76,7 +76,10 @@ def successor_planes_for_legals(
         trial.next_turn()
         boardarr = trial.get_board_arr()
         r2m = trial.move_side is not ChessSide.BLACK
-        enc = encode_model_planes(boardarr, r2m, trial, feature_list)
+        last_mv = f"{xa}{ya}-{xb}{yb}"
+        enc = encode_model_planes(
+            boardarr, r2m, trial, feature_list, last_move=last_mv
+        )
         rows.append(enc.astype(np.float32, copy=False))
     return np.stack(rows, axis=0)
 
@@ -151,11 +154,17 @@ def convert_game(
     ]
 
     bb = BaseChessBoard(fen)
+    prev_move: str | None = None
     for move_index, mv in enumerate(moves):
         red_to_move = bb.move_side is not ChessSide.BLACK
         boardarr_before = bb.get_board_arr()
         current_chw = encode_model_planes(
-            boardarr_before, red_to_move, bb, feature_list, move_index=move_index
+            boardarr_before,
+            red_to_move,
+            bb,
+            feature_list,
+            move_index=move_index,
+            last_move=prev_move,
         ).astype(np.float32, copy=False)
         x1, y1, x2, y2 = parse_move_squares(mv)
         legals = sorted(legal_moves_iccs_for_board(bb))
@@ -172,6 +181,7 @@ def convert_game(
         moveresult = bb.move(Pos(x1, y1), Pos(x2, y2))
         assert moveresult is not None
         bb.next_turn()
+        prev_move = mv
 
         value_cls = stm_outcome_class_from_red_outcome(outcome_cls, red_to_move)
 

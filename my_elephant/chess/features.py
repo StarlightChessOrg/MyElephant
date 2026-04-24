@@ -85,18 +85,20 @@ def encode_model_planes(
     feature_list: Mapping[str, list[str]] | None = None,
     *,
     move_index: int | None = None,
+    last_move: str | None = None,
 ) -> np.ndarray:
     """
     策略网络输入（**固定红方物理棋盘**坐标，不按行棋方翻转棋盘）：
 
-    - **7 路** 有符号兵种；**11 路** 理据（九宫、行棋方 ±1、将帅、将军、子力、灵活度等）；
-    - **6 路** ``plane_extras``：格坐标 x/8、y/9；谱面步数归一化；飞将；行棋方与对方**合法着法落点并集**。
+    - **7 路** 有符号兵种；**11 路** 理据；**``EXTRA_HINT_PLANE_COUNT`` 路** ``plane_extras``
+      （坐标、步序、飞将、着法并集、上一手、子力与将帅几何、吃子目标、兵纵深、双方车马炮控制等）。
 
-    通道数等于 ``POLICY_SELECT_IN_CHANNELS``（当前为 7+11+6）。``move_index`` 为从 0 起的本局步序号（棋谱迭代），推理可省略。
-    ``board_state`` 须含正确 ``move_side``；``red_to_move`` / ``feature_list`` 保留兼容，宜与 ``board_state`` 一致。
+    总通道 ``POLICY_SELECT_IN_CHANNELS`` = 7 + 11 + ``EXTRA_HINT_PLANE_COUNT``。``last_move`` 为产生当前局面的上一手 ICCS 串（如 ``77-67``），无则 ``None``。
     """
     _ = (red_to_move, feature_list)
     pieces = encode_signed_seven_planes(boardarr)
     rationale = encode_rationale_planes(boardarr, board_state)
-    extra = encode_extra_hint_planes(boardarr, board_state, move_index=move_index)
+    extra = encode_extra_hint_planes(
+        boardarr, board_state, move_index=move_index, last_move=last_move
+    )
     return np.concatenate([pieces, rationale, extra], axis=0)
