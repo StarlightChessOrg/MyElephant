@@ -8,6 +8,8 @@ import numpy as np
 
 from cchess.board import BaseChessBoard
 
+from my_elephant.chess.rationale import encode_rationale_planes
+
 # 与历史 notebook 中顺序保持一致
 FEATURE_LIST: dict[str, list[str]] = {
     "red": ["A", "B", "C", "K", "N", "P", "R"],
@@ -58,7 +60,7 @@ def encode_signed_seven_planes(boardarr: np.ndarray) -> np.ndarray:
     """
     七种兵种各一路，**固定红方/物理棋盘视角**（与 ``get_board_arr()`` 矩阵一致），不因轮到谁走而翻转。
     通道顺序：仕 A、相 B、炮 C、帅 K、马 N、兵 P、车 R；
-    格上红方该兵种 **+1**，黑方 **-1**，空 **0**。策略头始终在同一坐标系下打分，无需「轮到谁」输入通道。
+    格上红方该兵种 **+1**，黑方 **-1**，空 **0**。策略头在同一坐标系下打分；行棋方等全局线索由 ``encode_model_planes`` 拼接的理据平面提供。
     """
     pairs = [
         ("A", "a"),
@@ -82,10 +84,16 @@ def encode_model_planes(
     feature_list: Mapping[str, list[str]] | None = None,
 ) -> np.ndarray:
     """
-    策略网络输入：**仅 7 路有符号兵种平面**（红 +1 / 黑 -1），**固定红方视角**的盘面矩阵，不按行棋方翻转。
-    走棋方信息不进入网络；策略为「先 ICCS 起点格、再落点格」两阶段分类（与对弈点击顺序一致）；价值头在训练标签侧为**行棋方**三分类（见 ``stm_outcome_class_from_red_outcome``）。
+    策略网络输入（**固定红方物理棋盘**坐标，不按行棋方翻转棋盘）：
 
-    ``red_to_move`` / ``board_state`` / ``feature_list`` 保留以兼容调用方，当前不参与本函数编码。
+    - **7 路** ``encode_signed_seven_planes``：兵种有符号平面；
+    - **11 路** ``encode_rationale_planes``：九宫/半场、**行棋方常数平面**（红 +1 / 黑 −1）、
+      帅将位、被将军、子力价值、双方灵活度与着法质量等。
+
+    共 **18** 通道，与 ``POLICY_SELECT_IN_CHANNELS`` 一致。``board_state`` 须为走棋前的 ``BaseChessBoard``（含正确 ``move_side``）。
+    ``red_to_move`` / ``feature_list`` 保留以兼容旧调用方；理据通道由 ``board_state`` 推导，调用方宜保持 ``red_to_move`` 与 ``board_state`` 一致。
     """
-    _ = (red_to_move, board_state, feature_list)
-    return encode_signed_seven_planes(boardarr)
+    _ = (red_to_move, feature_list)
+    pieces = encode_signed_seven_planes(boardarr)
+    rationale = encode_rationale_planes(boardarr, board_state)
+    return np.concatenate([pieces, rationale], axis=0)

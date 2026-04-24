@@ -59,5 +59,5 @@ class GamePlay:
 
     def get_board_arr(self) -> np.ndarray:
         boardarr = self.bb.get_board_arr()
-        # 与训练一致：固定红方视角平面，行棋方不进编码
-        return encode_model_planes(boardarr, True, self.bb)
+        # 与训练一致：固定红方物理视角 + 理据平面（含行棋方）
+        return encode_model_planes(boardarr, self.red, self.bb)

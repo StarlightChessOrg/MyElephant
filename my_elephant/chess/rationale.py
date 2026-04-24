@@ -2,13 +2,13 @@
 在棋子平面之外，补充与「棋规 / 地理 / 将帅安危 / 子力与灵活度」相关的输入通道，
 让网络更容易接触「为何要走」的结构化线索（仍需训练目标配合，并非单靠特征即可学理）。
 
-11 个附加平面（`encode_rationale_planes` 堆叠顺序）：
-  1–7. 九宫、半场、（原「轮到谁走」位已弃用，恒为 0）、帅/将位、被将军（同前）
-  8. 带符号子力价值
-  9. 行棋方「着法数」灵活度 min(1, n/25)
- 10. 对方着法数灵活度
- 11. 行棋方「着法质量」灵活度：对马、车、兵等按落点/站位加权（马忌边线、忌跳入
-     己方九宫心一带；边马、窝心马站位降权；车占中路略奖；兵向前/过河略奖）
+11 个附加平面（`encode_rationale_planes` 堆叠顺序），与 7 路有符号子力平面拼接为策略网络输入：
+  1–3. 红九宫、黑九宫、黑方半场掩码
+  4. 行棋方：全图 +1（红走）或 −1（黑走）
+  5–6. 帅位、将位
+  7. 行棋方被将军（整盘同值）
+  8. 带符号子力价值（行棋方视角）
+  9–11. 行棋方 / 对方灵活度、行棋方着法质量灵活度
 """
 from __future__ import annotations
 
@@ -32,10 +32,11 @@ PIECE_VALUE_BY_FENCH: dict[str, float] = {
 
 # 旧版 14 路己方/对方二值平面（encode_picker_planes）；分析脚本仍可参考
 PIECE_PLANE_COUNT = 14
-# encode_rationale_planes 的附加通道数（当前策略训练不再拼接进模型输入）
+# encode_rationale_planes 的附加通道数（与 7 路子力平面在 encode_model_planes 中拼接）
 RATIONALE_PLANE_COUNT = 11
-# 策略网络输入：仅 7 路有符号兵种（红 +1 / 黑 -1），见 features.encode_model_planes
-POLICY_SELECT_IN_CHANNELS = 7
+# 策略网络输入：7 路有符号兵种 + 11 路理据平面，见 features.encode_model_planes
+PIECE_SIGNED_PLANE_COUNT = 7
+POLICY_SELECT_IN_CHANNELS = PIECE_SIGNED_PLANE_COUNT + RATIONALE_PLANE_COUNT
 # 训练批填充：合法着法数上界（一般远小于此；若棋谱超出需调大）
 POLICY_MAX_LEGAL_MOVES = 96
 # 策略「先起点后落点」：ICCS 9×10 展平为 90 格（下标 y*9+x）
@@ -115,6 +116,14 @@ def _king_planes(boardarr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _in_check_plane(cb: ChessBoard) -> np.ndarray:
     """当前行棋方是否被将军：整盘同值广播，便于卷积感知全局紧迫度。"""
     v = 1.0 if cb.is_checked() > 0 else 0.0
+    return np.full((10, 9), v, dtype=np.float32)
+
+
+def _side_to_move_plane(cb: ChessBoard) -> np.ndarray:
+    """行棋方提示：红走全 +1，黑走全 −1（固定物理棋盘坐标）。"""
+    if cb.move_side is None:
+        return np.zeros((10, 9), dtype=np.float32)
+    v = 1.0 if cb.move_side is not ChessSide.BLACK else -1.0
     return np.full((10, 9), v, dtype=np.float32)
 
 
@@ -252,8 +261,7 @@ def encode_rationale_planes(boardarr: np.ndarray, board_state: BaseChessBoard) -
     pr = _palace_red_mask()
     pb = _palace_black_mask()
     terr_b = _black_territory_mask()
-    # 不再编码「轮到谁走」：交互已隐含行棋方；此平面恒 0 以保留通道形状兼容。
-    turn_red = np.zeros((10, 9), dtype=np.float32)
+    stm = np.zeros((10, 9), dtype=np.float32)
     kr, kb = _king_planes(boardarr)
 
     chk = np.zeros((10, 9), dtype=np.float32)
@@ -263,6 +271,7 @@ def encode_rationale_planes(boardarr: np.ndarray, board_state: BaseChessBoard) -
     mob_q_self = np.zeros((10, 9), dtype=np.float32)
     try:
         cb = chess_board_from_base(board_state)
+        stm = _side_to_move_plane(cb)
         chk = _in_check_plane(cb)
         mat = _signed_material_plane(cb)
         if cb.move_side is not None:
@@ -273,6 +282,6 @@ def encode_rationale_planes(boardarr: np.ndarray, board_state: BaseChessBoard) -
         pass
 
     return np.stack(
-        [pr, pb, terr_b, turn_red, kr, kb, chk, mat, mob_self, mob_opp, mob_q_self],
+        [pr, pb, terr_b, stm, kr, kb, chk, mat, mob_self, mob_opp, mob_q_self],
         axis=0,
     ).astype(np.float32)

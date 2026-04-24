@@ -75,7 +75,8 @@ def successor_planes_for_legals(
         assert trial.move(Pos(xa, ya), Pos(xb, yb)) is not None
         trial.next_turn()
         boardarr = trial.get_board_arr()
-        enc = encode_model_planes(boardarr, True, trial, feature_list)
+        r2m = trial.move_side is not ChessSide.BLACK
+        enc = encode_model_planes(boardarr, r2m, trial, feature_list)
         rows.append(enc.astype(np.float32, copy=False))
     return np.stack(rows, axis=0)
 
@@ -136,7 +137,7 @@ def convert_game(
         dst_mask: (90,) bool，在**棋谱真实起点**下可达的落点格
         src_label: 起点展平下标 ``y*9+x``
         dst_label: 落点展平下标
-        outcome_cls: **行棋方**胜/和/负三分类下标，或 ``VALUE_LABEL_IGNORE``（不由样本张量携带「轮到谁」）
+        outcome_cls: **行棋方**胜/和/负三分类下标，或 ``VALUE_LABEL_IGNORE``；张量 ``C=POLICY_SELECT_IN_CHANNELS``（含行棋方等理据平面）
     """
     doc = _load_record(onefile)
     head = doc["ChineseChessRecord"]["Head"]
@@ -154,7 +155,7 @@ def convert_game(
         red_to_move = bb.move_side is not ChessSide.BLACK
         boardarr_before = bb.get_board_arr()
         current_chw = encode_model_planes(
-            boardarr_before, True, bb, feature_list
+            boardarr_before, red_to_move, bb, feature_list
         ).astype(np.float32, copy=False)
         x1, y1, x2, y2 = parse_move_squares(mv)
         legals = sorted(legal_moves_iccs_for_board(bb))

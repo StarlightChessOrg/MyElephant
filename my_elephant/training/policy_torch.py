@@ -186,7 +186,7 @@ def _encode_gameplay_current_nchw(
 ) -> torch.Tensor:
     raw = np.asarray(gameplay.bb._board[::-1])
     # 固定红方物理视角；行棋方不进平面（由交互/规则隐含）
-    cur_chw = encode_model_planes(raw, True, gameplay.bb, flist)
+    cur_chw = encode_model_planes(raw, gameplay.red, gameplay.bb, flist)
     cur_hwc = np.transpose(cur_chw, (1, 2, 0))
     t = (
         torch.from_numpy(np.ascontiguousarray(np.expand_dims(cur_hwc, 0)))

@@ -450,7 +450,12 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="推理设备：>=0 且存在 CUDA 时使用 ``cuda:N``；无 CUDA 时自动回退 CPU；``-1`` 强制 CPU",
     )
-    p.add_argument("--in-channels", type=int, default=None)
+    p.add_argument(
+        "--in-channels",
+        type=int,
+        default=None,
+        help="与 checkpoint stem 一致；默认从 ckpt 读。新模型为 18（7 子力+11 理据），仅 7 通道旧权重请传 7",
+    )
     p.add_argument(
         "--mcts-sims",
         type=int,
