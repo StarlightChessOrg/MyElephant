@@ -1,4 +1,7 @@
-"""本地 HTTP 评估：父进程 MCTS 将局面 FEN POST 到子进程，子进程内跑 ``eval_policy_value_at_root``（优先 GPU，见 ``policy_eval_worker``）。"""
+"""本地 HTTP 评估：父进程 MCTS 将局面 FEN POST 到子进程，子进程内跑 ``eval_policy_value_at_root``（优先 GPU，见 ``policy_eval_worker``）。
+
+``POST /eval`` JSON 支持 ``{"fen": "...", "policy_temperature": 1.5}``；省略 ``policy_temperature`` 时默认为 ``1``。
+"""
 
 from __future__ import annotations
 
@@ -36,11 +39,18 @@ def gameplay_from_fen(fen: str) -> GamePlay:
 class PolicyHTTPEvalClient:
     """轮询多个 ``base_url``（各对应一评估子进程），阻塞 POST ``/eval``。"""
 
-    def __init__(self, base_urls: list[str], *, timeout_s: float = 120.0) -> None:
+    def __init__(
+        self,
+        base_urls: list[str],
+        *,
+        timeout_s: float = 120.0,
+        policy_temperature: float = 1.0,
+    ) -> None:
         self._urls = [u.rstrip("/") for u in base_urls if u.strip()]
         if not self._urls:
             raise ValueError("PolicyHTTPEvalClient: 至少需要一个 base_url")
         self._timeout_s = float(timeout_s)
+        self._policy_temperature = float(policy_temperature)
         self._rr = cycle(range(len(self._urls)))
         self._lock = threading.Lock()
 
@@ -51,7 +61,10 @@ class PolicyHTTPEvalClient:
 
     def eval_policy_value(self, gp: GamePlay) -> tuple[list[str], np.ndarray, float]:
         fen = gameplay_to_fen(gp)
-        payload = json.dumps({"fen": fen}).encode("utf-8")
+        payload = json.dumps(
+            {"fen": fen, "policy_temperature": self._policy_temperature},
+            ensure_ascii=False,
+        ).encode("utf-8")
         url = self._next_url() + "/eval"
         req = urllib.request.Request(
             url,
@@ -199,8 +212,14 @@ def run_eval_http_server(
                 if not fen:
                     self._json_err(400, "missing fen")
                     return
+                try:
+                    policy_temperature = float(obj.get("policy_temperature", 1.0))
+                except (TypeError, ValueError):
+                    policy_temperature = 1.0
                 gp = gameplay_from_fen(fen)
-                legals, priors, v = eval_policy_value_at_root(gp, model, device, flist)
+                legals, priors, v = eval_policy_value_at_root(
+                    gp, model, device, flist, policy_temperature=policy_temperature
+                )
                 out = {
                     "ok": True,
                     "legals": legals,

@@ -1,7 +1,7 @@
 """
 策略评估 HTTP 子进程入口：``python -m my_elephant.training.policy_eval_worker --checkpoint ... --port 17890``
 
-绑定 ``127.0.0.1``，提供 ``GET /health``、``POST /eval``（JSON ``{"fen": "..."}``）。
+绑定 ``127.0.0.1``，提供 ``GET /health``、``POST /eval``（JSON ``{"fen": "..."}``，可选 ``"policy_temperature": 1.5``）。
 默认 ``--gpu 0``：有 CUDA 时在 GPU 上前向；无 CUDA 或 ``--gpu -1`` 时用 CPU。
 """
 

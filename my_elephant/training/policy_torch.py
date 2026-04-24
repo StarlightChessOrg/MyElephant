@@ -231,6 +231,14 @@ def infer_greedy_move_string(
     return f"{sx}{sy}-{dx}{dy}"
 
 
+def _policy_temperature_scalar(policy_temperature: float) -> float:
+    """合法正温度；非法或非正时退化为 1.0（与旧版 softmax 一致）。"""
+    t = float(policy_temperature)
+    if not (t > 0.0) or math.isnan(t) or math.isinf(t):
+        return 1.0
+    return t
+
+
 @torch.no_grad()
 def _root_prior_value_from_hidden_row(
     feat: torch.Tensor,
@@ -238,13 +246,16 @@ def _root_prior_value_from_hidden_row(
     legals_t: list[tuple[int, int, int, int]],
     model: SuccessorPolicy,
     device: torch.device,
+    *,
+    policy_temperature: float = 1.0,
 ) -> tuple[list[str], np.ndarray, float]:
     """单局面：已有 ``trunk`` 隐层与 ``head_src`` 一行 logits，完成落点头与价值，返回 ``(legals_s, pri_arr, v)``。"""
+    T = _policy_temperature_scalar(policy_temperature)
     legals_s = [f"{a}{b}-{c}{d}" for (a, b, c, d) in legals_t]
     src_mask = torch.zeros(POLICY_GRID_NUMEL, dtype=torch.bool, device=device)
     for x1, y1, _, _ in legals_t:
         src_mask[y1 * 9 + x1] = True
-    p_src = torch.softmax(ls_logits.masked_fill(~src_mask, -1e9), dim=0)
+    p_src = torch.softmax((ls_logits / T).masked_fill(~src_mask, -1e9), dim=0)
     origins: list[tuple[int, int]] = []
     seen: set[tuple[int, int]] = set()
     for x1, y1, _, _ in legals_t:
@@ -265,7 +276,7 @@ def _root_prior_value_from_hidden_row(
         for x1, y1, x2, y2 in legals_t:
             if (x1, y1) == (ox, oy):
                 dm[y2 * 9 + x2] = True
-        p_dst_given[(ox, oy)] = torch.softmax(ld.masked_fill(~dm, -1e9), dim=0)
+        p_dst_given[(ox, oy)] = torch.softmax((ld / T).masked_fill(~dm, -1e9), dim=0)
     pri: list[float] = []
     for x1, y1, x2, y2 in legals_t:
         i_s = y1 * 9 + x1
@@ -287,10 +298,14 @@ def batched_eval_policy_value_at_root(
     model: SuccessorPolicy,
     device: torch.device,
     flist: dict[str, list[str]],
+    *,
+    policy_temperature: float = 1.0,
 ) -> list[tuple[list[str], np.ndarray, float]]:
     """
     多根局面：共享一次 ``trunk`` + ``head_src`` 批前向，再逐局完成 ``head_dst`` 与价值（各局合法起点数不同，落点头仍按局批）。
     与 ``eval_policy_value_at_root`` 数值一致；无合法着法的局面不占用 GPU。
+
+    ``policy_temperature``：对 ``head_src`` / ``head_dst`` 的 logits 做 ``softmax(logits/T)``；``T>1`` 先验更平、``T<1`` 更尖（默认 ``1`` 与旧行为一致）。
     """
     n = len(gameplays)
     if n == 0:
@@ -319,7 +334,7 @@ def batched_eval_policy_value_at_root(
         feat_row = feat_b[bi : bi + 1]
         ls_row = ls_b[bi]
         out[j] = _root_prior_value_from_hidden_row(
-            feat_row, ls_row, legals_per[j], model, device
+            feat_row, ls_row, legals_per[j], model, device, policy_temperature=policy_temperature
         )
     return [out[i] for i in range(n)]  # type: ignore[list-item]
 
@@ -330,12 +345,16 @@ def eval_policy_value_at_root(
     model: SuccessorPolicy,
     device: torch.device,
     flist: dict[str, list[str]],
+    *,
+    policy_temperature: float = 1.0,
 ) -> tuple[list[str], np.ndarray, float]:
     """
     MCTS 用：对当前局面枚举合法着法，用分解式 ``P(着)=P(起点)P(落点|起点)`` 得到与 ``legals`` 对齐的 prior，
     并给出轮到方价值标量（由**行棋方**三分类 ``P(胜)-P(负)``，无需再按红黑翻转）。
     """
-    return batched_eval_policy_value_at_root([gameplay], model, device, flist)[0]
+    return batched_eval_policy_value_at_root(
+        [gameplay], model, device, flist, policy_temperature=policy_temperature
+    )[0]
 
 
 class QueuedBatchedRootEvaluator:
@@ -354,12 +373,14 @@ class QueuedBatchedRootEvaluator:
         *,
         max_batch: int = 16,
         max_wait_s: float = 0.002,
+        policy_temperature: float = 1.0,
     ) -> None:
         if device.type != "cuda":
             raise ValueError("QueuedBatchedRootEvaluator 仅用于 CUDA 设备")
         self._model = model
         self._device = device
         self._flist = flist
+        self._policy_temperature = float(policy_temperature)
         self._max_batch = max(1, int(max_batch))
         self._max_wait_s = max(0.0, float(max_wait_s))
         self._in_q: queue.Queue[tuple[GamePlay, queue.Queue] | object] = queue.Queue()
@@ -404,7 +425,13 @@ class QueuedBatchedRootEvaluator:
                 batch.append(nxt)  # type: ignore[arg-type]
             gps = [b[0] for b in batch]
             try:
-                outs = batched_eval_policy_value_at_root(gps, self._model, self._device, self._flist)
+                outs = batched_eval_policy_value_at_root(
+                    gps,
+                    self._model,
+                    self._device,
+                    self._flist,
+                    policy_temperature=self._policy_temperature,
+                )
             except Exception as e:
                 for _, rq in batch:
                     rq.put(e)
@@ -446,6 +473,7 @@ def infer_1ply_value_prior_move(
     prior_weight: float = 1.0,
     value_weight: float = 1.0,
     prior_eps: float = 1e-8,
+    policy_temperature: float = 1.0,
 ) -> str:
     """
     根节点单层搜索：枚举全部合法着，用 ``eval_policy_value_at_root`` 的 prior ``P(a)``，
@@ -455,7 +483,9 @@ def infer_1ply_value_prior_move(
     from my_elephant.chess.board_utils import chess_board_from_base
     from my_elephant.training.mcts_engine import copy_gameplay
 
-    legals_s, pri_arr, _ = eval_policy_value_at_root(gameplay, model, device, flist)
+    legals_s, pri_arr, _ = eval_policy_value_at_root(
+        gameplay, model, device, flist, policy_temperature=policy_temperature
+    )
     if not legals_s:
         raise RuntimeError("无合法着法")
     n = len(legals_s)

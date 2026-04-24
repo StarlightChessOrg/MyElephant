@@ -112,11 +112,13 @@ class XiangqiPlaySession:
         neural_mode: str = "1ply",
         neural_prior_weight: float = 1.0,
         neural_value_weight: float = 1.0,
+        policy_temperature: float = 1.0,
     ) -> None:
         self._lock = threading.Lock()
         self.model = model
         self.device = device
         self.flist = flist
+        self.policy_temperature = float(policy_temperature)
         self.mcts_sims = mcts_sims
         self.c_puct = c_puct
         self.mcts_max_seconds = mcts_max_seconds
@@ -129,7 +131,9 @@ class XiangqiPlaySession:
         self.neural_value_weight = neural_value_weight
         self._root_eval_batcher: QueuedBatchedRootEvaluator | None = None
         if mcts_http_client is None and device.type == "cuda":
-            self._root_eval_batcher = QueuedBatchedRootEvaluator(model, device, flist)
+            self._root_eval_batcher = QueuedBatchedRootEvaluator(
+                model, device, flist, policy_temperature=self.policy_temperature
+            )
         self.game = GamePlay()
         self.sel_from: tuple[int, int] | None = None
         self.last_move: tuple[int, int, int, int] | None = None
@@ -357,6 +361,7 @@ class XiangqiPlaySession:
             ex = self._mcts_executor
             http_client = self._mcts_http_client
             root_batcher = self._root_eval_batcher
+            policy_temp = self.policy_temperature
 
         def worker() -> None:
             mcts_st: MCTSSearchStats | None = None
@@ -374,6 +379,7 @@ class XiangqiPlaySession:
                             flist,
                             prior_weight=neural_pw,
                             value_weight=neural_vw,
+                            policy_temperature=policy_temp,
                         )
                 else:
                     if http_client is not None:
@@ -381,7 +387,9 @@ class XiangqiPlaySession:
                     elif root_batcher is not None:
                         ev = root_batcher.eval_sync
                     else:
-                        ev = lambda gp: eval_policy_value_at_root(gp, model, device, flist)
+                        ev = lambda gp, pt=policy_temp: eval_policy_value_at_root(
+                            gp, model, device, flist, policy_temperature=pt
+                        )
 
                     mv, mcts_st, root_out = mcts_search(
                         g,
@@ -498,6 +506,15 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="纯网络 1ply：-V(后继) 项系数",
+    )
+    p.add_argument(
+        "--policy-temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "策略网络先验温度 T：根上 P(src)、P(dst|src) 用 softmax(logits/T)。"
+            "T>1 更平（MCTS/1ply 更敢探低先验边）；T<1 更尖；默认 1 与旧版一致"
+        ),
     )
     p.add_argument("--host", type=str, default="127.0.0.1", help="监听地址；服务器对外访问请用 0.0.0.0")
     p.add_argument("--port", type=int, default=8765, help="监听端口")
@@ -884,7 +901,9 @@ def main() -> None:
             in_channels=args.in_channels,
             gpu=int(args.gpu),
         )
-        mcts_http_client = PolicyHTTPEvalClient(http_urls)
+        mcts_http_client = PolicyHTTPEvalClient(
+            http_urls, policy_temperature=float(args.policy_temperature)
+        )
 
     model, flist = load_successor_policy_for_play(
         args.checkpoint, device, in_channels=args.in_channels
@@ -904,6 +923,7 @@ def main() -> None:
         neural_mode=args.neural_mode,
         neural_prior_weight=args.neural_prior_weight,
         neural_value_weight=args.neural_value_weight,
+        policy_temperature=float(args.policy_temperature),
     )
     atexit.register(session.shutdown_all_mcts_resources)
 
